@@ -7,7 +7,10 @@ Dollar figures are an estimate: Claude token counts priced at public API rates.
 Codex publishes no per-token rate for subscription plans, so its rows carry
 tokens only and a cost of 0.
 
-Emits TSV:  KIND \t name \t tokens \t cost \t messages \t padded-name
+Emits TSV:  KIND \t name \t tokens \t cost \t messages \t padded-name \t priced
+
+`priced` is 0 when no published rate is known for that model, in which case
+`cost` is 0 and the totals are a floor rather than an estimate.
 
 KIND is TOTAL / PROJ / MODEL for Claude and CODEX_TOTAL / CODEX_PROJ /
 CODEX_MODEL for Codex.
@@ -48,14 +51,19 @@ PRICES = (
     ("claude-sonnet-4-6",  3.0, 15.0, 0.30),
     ("claude-haiku-4",     1.0,  5.0, 0.10),
 )
-DEFAULT_PRICE = (5.0, 25.0, 0.50)
 
 
 def price_for(model):
+    """Returns None for a model the table has never seen.
+
+    Guessing a rate would put a confident wrong dollar figure on screen, which
+    is worse than admitting the gap - so unpriced models are counted in tokens
+    and left out of the cost.
+    """
     for prefix, pin, pout, pread in PRICES:
         if model.startswith(prefix):
             return pin, pout, pread
-    return DEFAULT_PRICE
+    return None
 
 
 def window(days):
@@ -149,6 +157,8 @@ def main():
     file_cutoff = start - 86400  # mtime is the last write, so keep a day of slack
 
     seen = set()
+    unpriced = set()
+    unpriced_projects = set()
     projects, models = {}, {}
     total_tok = total_cost = total_msgs = 0
 
@@ -205,11 +215,16 @@ def main():
                     tout = usage.get("output_tokens") or 0
                     cr = usage.get("cache_read_input_tokens") or 0
 
-                    pin, pout, pread = price_for(model)
-                    if usage.get("speed") == "fast":
-                        pin, pout, pread = pin * 2, pout * 2, pread * 2
-                    cost = (tin * pin + tout * pout + w5 * pin * 1.25
-                            + w1h * pin * 2 + cr * pread) / 1_000_000
+                    rate = price_for(model)
+                    if rate is None:
+                        unpriced.add(model)
+                        cost = 0.0
+                    else:
+                        pin, pout, pread = rate
+                        if usage.get("speed") == "fast":
+                            pin, pout, pread = pin * 2, pout * 2, pread * 2
+                        cost = (tin * pin + tout * pout + w5 * pin * 1.25
+                                + w1h * pin * 2 + cr * pread) / 1_000_000
                     tok = tin + tout + w5 + w1h + cr
 
                     cwd = rec.get("cwd")
@@ -217,6 +232,10 @@ def main():
                     if proj in ("", "/"):
                         proj = "~"
 
+                    if rate is None:
+                        # A project's cost is only meaningful if every model in
+                        # it had a rate; otherwise $0.00 would read as "free".
+                        unpriced_projects.add(proj)
                     p = projects.setdefault(proj, [0, 0.0, 0])
                     p[0] += tok; p[1] += cost; p[2] += 1
                     m = models.setdefault(model, [0, 0.0, 0])
@@ -229,21 +248,28 @@ def main():
 
     out = sys.stdout
 
-    def emit(kind, name, tok, cost, msgs):
+    def emit(kind, name, tok, cost, msgs, priced=1):
         clean = name.replace("\t", " ")
-        out.write("%s\t%s\t%d\t%.4f\t%d\t%s\n" % (kind, clean, tok, cost, msgs, fit(clean)))
+        out.write("%s\t%s\t%d\t%.4f\t%d\t%s\t%d\n"
+                  % (kind, clean, tok, cost, msgs, fit(clean), priced))
 
-    emit("TOTAL", "all", total_tok, total_cost, total_msgs)
-    for kind, table in (("PROJ", projects), ("MODEL", models)):
-        for name, (tok, cost, msgs) in sorted(
-                table.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
-            emit(kind, name, tok, cost, msgs)
+    emit("TOTAL", "all", total_tok, total_cost, total_msgs,
+         0 if unpriced else 1)
+    for name, (tok, cost, msgs) in sorted(
+            projects.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
+        emit("PROJ", name, tok, cost, msgs, 0 if name in unpriced_projects else 1)
+    for name, (tok, cost, msgs) in sorted(
+            models.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
+        emit("MODEL", name, tok, cost, msgs, 0 if name in unpriced else 1)
+    for name in sorted(unpriced):
+        emit("UNPRICED", name, 0, 0.0, 0, 0)
 
-    emit("CODEX_TOTAL", "all", cx_tok, 0.0, cx_msgs)
+    # Codex publishes no per-token rate for subscription plans at all.
+    emit("CODEX_TOTAL", "all", cx_tok, 0.0, cx_msgs, 0)
     for kind, table in (("CODEX_PROJ", cx_projects), ("CODEX_MODEL", cx_models)):
         for name, (tok, cost, msgs) in sorted(
                 table.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
-            emit(kind, name, tok, cost, msgs)
+            emit(kind, name, tok, cost, msgs, 0)
 
 
 if __name__ == "__main__":

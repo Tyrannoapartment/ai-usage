@@ -27,11 +27,22 @@
 
 set -uo pipefail
 
-CLAUDE_CREDS=${AI_USAGE_CLAUDE_CREDS:-$HOME/.claude/.credentials.json}
-CODEX_CREDS=${AI_USAGE_CODEX_CREDS:-$HOME/.codex/auth.json}
-CLAUDE_DIR=${AI_USAGE_CLAUDE_DIR:-$HOME/.claude/projects}
-CODEX_DIR=${AI_USAGE_CODEX_DIR:-$HOME/.codex/sessions}
+ACCOUNTS_FILE=${AI_USAGE_ACCOUNTS:-$HOME/.config/ai-usage/accounts.json}
 CACHE_DIR=${AI_USAGE_CACHE_DIR:-$HOME/.cache/ai-usage}
+
+# Set per account by with_account(); the single-account case just points these
+# at the standard locations.
+CLAUDE_HOME=$HOME/.claude
+CODEX_HOME_DIR=$HOME/.codex
+CLAUDE_CREDS=${AI_USAGE_CLAUDE_CREDS:-$CLAUDE_HOME/.credentials.json}
+CODEX_CREDS=${AI_USAGE_CODEX_CREDS:-$CODEX_HOME_DIR/auth.json}
+CLAUDE_DIR=${AI_USAGE_CLAUDE_DIR:-$CLAUDE_HOME/projects}
+CODEX_DIR=${AI_USAGE_CODEX_DIR:-$CODEX_HOME_DIR/sessions}
+ACCT_ID=a0
+ACCT_LABEL=""
+HAS_CLAUDE=1
+HAS_CODEX=1
+USE_KEYCHAIN=1
 # Locate lib/aggregate.py relative to this script, following symlinks so the
 # command can be linked onto PATH from anywhere.
 self_path=$0
@@ -51,6 +62,7 @@ CODEX_URL=https://chatgpt.com/backend-api/wham/usage
 INTERVAL=1      # screen redraw - keeps the countdowns live
 QUOTA_TTL=60    # how often the quota APIs are re-queried
 LOCAL_TTL=90    # how often local transcripts are re-aggregated
+RATE_LIMIT_COOLDOWN=300   # how long to stay off an endpoint after a 429
 DAYS=1
 ONCE=0
 MODE=live
@@ -76,6 +88,70 @@ for b in jq curl awk python3; do
   command -v "$b" >/dev/null 2>&1 || { echo "ai-usage: '$b' is required" >&2; exit 1; }
 done
 mkdir -p "$CACHE_DIR"
+
+# -------------------------------------------------------------- accounts ----
+# People who run several Claude or Codex logins keep each one in its own
+# config directory (CLAUDE_CONFIG_DIR / CODEX_HOME). accounts.json just lists
+# those directories; with no file, the standard pair is the only account.
+# The tilde must stay literal on both sides: bash expands it inside ${x#word},
+# so an unquoted ${1#~/} strips nothing and leaves "~" in the path.
+expand_home() {
+  case "$1" in
+    "~"/*) printf '%s' "$HOME/${1#"~"/}" ;;
+    "~")   printf '%s' "$HOME" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+load_accounts() {
+  if [ -r "$ACCOUNTS_FILE" ] && jq -e '.accounts | length > 0' "$ACCOUNTS_FILE" >/dev/null 2>&1; then
+    jq -r '.accounts | to_entries[]
+           | [("a" + (.key | tostring)),
+              (if (.value.label // "") == "" then "-" else .value.label end),
+              (if (.value.claude // "") == "" then "-" else .value.claude end),
+              (if (.value.codex // "") == "" then "-" else .value.codex end)]
+           | @tsv' "$ACCOUNTS_FILE"
+  else
+    printf 'a0\t-\t%s\t%s\n' "$HOME/.claude" "$HOME/.codex"
+  fi
+}
+
+account_count() { load_accounts | grep -c . ; }
+
+with_account() {   # id, label, claude home, codex home; "-" means unset
+  ACCT_ID=$1
+  ACCT_LABEL=$([ "$2" = "-" ] && printf '' || printf '%s' "$2")
+  local claude codex
+  claude=$([ "${3:-}" = "-" ] && printf '' || expand_home "${3:-}")
+  codex=$([ "${4:-}" = "-" ] && printf '' || expand_home "${4:-}")
+
+  if [ -n "$claude" ]; then
+    HAS_CLAUDE=1
+    CLAUDE_HOME=$claude
+    CLAUDE_CREDS=$claude/.credentials.json
+    CLAUDE_DIR=$claude/projects
+  else
+    HAS_CLAUDE=0
+    # Leaving CLAUDE_HOME at the previous account's value would let a
+    # codex-only account inherit the default account's keychain access.
+    CLAUDE_HOME=""
+    CLAUDE_CREDS=/nonexistent; CLAUDE_DIR=/nonexistent
+  fi
+
+  if [ -n "$codex" ]; then
+    HAS_CODEX=1
+    CODEX_HOME_DIR=$codex
+    CODEX_CREDS=$codex/auth.json
+    CODEX_DIR=$codex/sessions
+  else
+    HAS_CODEX=0
+    CODEX_CREDS=/nonexistent; CODEX_DIR=/nonexistent
+  fi
+
+  # The Keychain holds exactly one Claude Code credential, so only the default
+  # config directory may read it; other accounts use their own file.
+  [ "$CLAUDE_HOME" = "$HOME/.claude" ] && USE_KEYCHAIN=1 || USE_KEYCHAIN=0
+}
 
 # ---------------------------------------------------------------- colors ----
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -167,6 +243,7 @@ file_age() { local m
 # leaves ~/.claude/.credentials.json behind as a copy that can go stale. Read
 # both and use whichever token expires later.
 keychain_cred() {
+  [ "${USE_KEYCHAIN:-1}" = "1" ] || return 1
   command -v security >/dev/null 2>&1 || return 1
   security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
     || security find-generic-password -s "Claude Code-credentials" -w \
@@ -174,6 +251,7 @@ keychain_cred() {
 }
 
 keychain_item_present() {
+  [ "${USE_KEYCHAIN:-1}" = "1" ] || return 1
   command -v security >/dev/null 2>&1 || return 1
   security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 \
     || security find-generic-password -s "Claude Code-credentials" \
@@ -192,29 +270,51 @@ claude_cred() {
   else printf '%s' "${k:-${f:-}}"; fi
 }
 
+# A polled endpoint will eventually answer 429. Record that separately so the
+# tool can say so and stop hammering, instead of reporting a generic failure.
+note_status() {   # source, http status
+  local f="$CACHE_DIR/$ACCT_ID-$1.status"
+  printf '%s %s\n' "$2" "$(date +%s)" > "$f"
+}
+
+last_status() { cut -d' ' -f1 < "$CACHE_DIR/$ACCT_ID-$1.status" 2>/dev/null; }
+status_age() { file_age "$CACHE_DIR/$ACCT_ID-$1.status"; }
+
 producer_claude() {
-  local tok; tok=$(claude_cred | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-  [ -n "$tok" ] || return 1
-  curl -sS --max-time 10 --fail "$CLAUDE_URL" \
+  local tok body status
+  tok=$(claude_cred | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+  [ -n "$tok" ] || { note_status claude no-credentials; return 1; }
+  body=$(curl -sS --max-time 10 -w '\n%{http_code}' "$CLAUDE_URL" \
     -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
-    -H "User-Agent: ai-usage.sh (local quota monitor)" -H "Accept: application/json" \
-    | jq -e . 2>/dev/null
+    -H "User-Agent: ai-usage.sh (local quota monitor)" -H "Accept: application/json" 2>/dev/null)
+  status=$(printf '%s' "$body" | tail -1)
+  note_status claude "$status"
+  [ "$status" = "200" ] || return 1
+  printf '%s' "$body" | sed '$d' | jq -e . 2>/dev/null
 }
 
 producer_codex() {
-  local tok acct
+  local tok acct body status
   tok=$(jq -r '.tokens.access_token // empty' "$CODEX_CREDS" 2>/dev/null)
   acct=$(jq -r '.tokens.account_id // empty' "$CODEX_CREDS" 2>/dev/null)
-  [ -n "$tok" ] || return 1
-  curl -sS --max-time 10 --fail "$CODEX_URL" \
+  [ -n "$tok" ] || { note_status codex no-credentials; return 1; }
+  body=$(curl -sS --max-time 10 -w '\n%{http_code}' "$CODEX_URL" \
     -H "Authorization: Bearer $tok" ${acct:+-H "chatgpt-account-id: $acct"} \
-    -H "originator: codex_cli_rs" -H "Accept: application/json" \
-    | jq -e . 2>/dev/null
+    -H "originator: codex_cli_rs" -H "Accept: application/json" 2>/dev/null)
+  status=$(printf '%s' "$body" | tail -1)
+  note_status codex "$status"
+  [ "$status" = "200" ] || return 1
+  printf '%s' "$body" | sed '$d' | jq -e . 2>/dev/null
 }
 
 producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" "$CODEX_DIR" 2>/dev/null; }
 
-cache_file() { case "$1" in local) echo "$CACHE_DIR/local-$DAYS.tsv" ;; *) echo "$CACHE_DIR/$1.json" ;; esac; }
+cache_file() {
+  case "$1" in
+    local) echo "$CACHE_DIR/$ACCT_ID-local-$DAYS.tsv" ;;
+    *)     echo "$CACHE_DIR/$ACCT_ID-$1.json" ;;
+  esac
+}
 
 fetch_sync() {   # name -> 0 if the cache now holds something usable
   local name=$1 out tmp
@@ -229,7 +329,7 @@ fetch_sync() {   # name -> 0 if the cache now holds something usable
 # call or a transcript scan.
 fetch_async() {
   local name=$1 lock
-  lock="$CACHE_DIR/$name.lock"
+  lock="$CACHE_DIR/$ACCT_ID-$name.lock"
   mkdir "$lock" 2>/dev/null || return 0
   ( fetch_sync "$name"; rmdir "$lock" ) >/dev/null 2>&1 &
 }
@@ -243,6 +343,12 @@ ensure() {   # name, ttl, force -> echoes ok | stale | missing
       echo missing; return
     fi
     fetch_async "$name"; echo missing; return
+  fi
+  # Respect a cooldown after being rate limited, force or not.
+  if [ "$name" != "local" ] && [ "$(last_status "$name")" = "429" ] \
+     && [ "$(status_age "$name")" -lt "$RATE_LIMIT_COOLDOWN" ]; then
+    [ "$age" -ge $(( ttl * 5 )) ] && echo stale || echo ok
+    return
   fi
   if [ "$force" = "1" ] || [ "$age" -ge "$ttl" ]; then
     if [ "$ONCE" = "1" ]; then fetch_sync "$name" >/dev/null; else fetch_async "$name"; fi
@@ -267,8 +373,8 @@ CODEX_ROWS_JQ='
 (.rate_limit // {}) | [ .primary_window, .secondary_window ] | map(select(. != null)) | .[]
 | [ (.limit_window_seconds // 0 | tostring), .used_percent, (.reset_at // 0) ] | @tsv'
 
-claude_rows() { jq -r "$CLAUDE_ROWS_JQ" "$CACHE_DIR/claude.json" 2>/dev/null; }
-codex_rows() { jq -r "$CODEX_ROWS_JQ" "$CACHE_DIR/codex.json" 2>/dev/null \
+claude_rows() { jq -r "$CLAUDE_ROWS_JQ" "$(cache_file claude)" 2>/dev/null; }
+codex_rows() { jq -r "$CODEX_ROWS_JQ" "$(cache_file codex)" 2>/dev/null \
   | while IFS=$'\t' read -r w p r; do printf '%s\t%s\t%s\n' "$(win_label "$w")" "$p" "$r"; done; }
 
 claude_note() { jq -r '
@@ -277,7 +383,7 @@ claude_note() { jq -r '
        "extra spend $\(.spend.used.amount_minor / pow(10; .spend.used.exponent))" else empty end),
     ((.limits // []) | map(select(.severity != null and .severity != "normal") | .severity)
       | if length > 0 then "severity " + join(",") else empty end) ]
-  | join("  ")' "$CACHE_DIR/claude.json" 2>/dev/null; }
+  | join("  ")' "$(cache_file claude)" 2>/dev/null; }
 
 codex_note() { jq -r '
   [ "plan \(.plan_type // "?")",
@@ -286,7 +392,7 @@ codex_note() { jq -r '
     (if .rate_limit_reset_credits.available_count then
        "reset credits \(.rate_limit_reset_credits.available_count)" else empty end),
     (if .spend_control.reached == true then "SPEND LIMIT REACHED" else empty end) ]
-  | join("  ")' "$CACHE_DIR/codex.json" 2>/dev/null; }
+  | join("  ")' "$(cache_file codex)" 2>/dev/null; }
 
 local_rows() { grep "^$1"$'\t' "$(cache_file local)" 2>/dev/null; }
 
@@ -299,6 +405,10 @@ claude_hint() {
       || echo "not signed in - run: claude"
     return
   fi
+  case "$(last_status claude)" in
+    429) echo "rate limited by the usage API - backing off for $(( (RATE_LIMIT_COOLDOWN - $(status_age claude)) / 60 + 1 ))m"; return ;;
+    401|403) echo "the usage API rejected this token - run: claude"; return ;;
+  esac
   exp=$(cred_expiry "$cred"); now=$(date +%s)   # BSD awk has no systime()
   if [ "${exp:-0}" != "0" ] && awk -v e="$exp" -v n="$now" 'BEGIN { exit !(e/1000 < n) }'; then
     if keychain_item_present && [ -z "$(keychain_cred)" ]; then
@@ -313,7 +423,27 @@ claude_hint() {
 
 codex_hint() {
   [ -f "$CODEX_CREDS" ] || { echo "not signed in - run: codex login"; return; }
+  case "$(last_status codex)" in
+    429) echo "rate limited by the usage API - backing off for $(( (RATE_LIMIT_COOLDOWN - $(status_age codex)) / 60 + 1 ))m"; return ;;
+    401|403) echo "the usage API rejected this token - run: codex login"; return ;;
+  esac
   echo "could not reach the usage API - if this persists, run: codex login"
+}
+
+# Codex reports the signed-in email; Claude's usage API identifies nothing, so
+# its plan from the credential file is the best available label.
+claude_label() {
+  [ -n "$ACCT_LABEL" ] && { printf '%s' "$ACCT_LABEL"; return; }
+  local plan
+  plan=$(claude_cred | jq -r '.claudeAiOauth.subscriptionType // empty' 2>/dev/null)
+  printf '%s' "${plan:-$ACCT_ID}"
+}
+
+codex_label() {
+  [ -n "$ACCT_LABEL" ] && { printf '%s' "$ACCT_LABEL"; return; }
+  local email
+  email=$(jq -r '.email // empty' "$(cache_file codex)" 2>/dev/null)
+  printf '%s' "${email:-$ACCT_ID}"
 }
 
 # ------------------------------------------------------------- rendering ----
@@ -343,7 +473,13 @@ quota_section() {   # title, color, status, rows-fn, note-fn, cache, hint-fn
     [ -n "$label" ] || continue
     got=1; quota_row "$label" "$pct" "${reset:-0}" "$now"
   done < <("$rowsfn")
-  [ "$got" = "1" ] || printf '  %sno active limits reported%s\n' "$C_DIM" "$C_RESET"
+  if [ "$got" != "1" ]; then
+    # The call succeeded, so an empty parse means the response no longer looks
+    # the way this version expects - say that rather than showing a blank.
+    printf '  %scould not read any limit from the response - the API shape may%s\n' \
+      "$C_YELLOW" "$C_RESET"
+    printf '  %shave changed. Run: ai-usage --json%s\n' "$C_YELLOW" "$C_RESET"
+  fi
   local note; note=$("$notefn")
   [ -n "$note" ] && printf '  %-*s %s%s%s\n' "$LBL" "" "$C_DIM" "$note" "$C_RESET"
   printf '  %-*s %s%s ago%s\n' "$LBL" "" "$C_DIM" "$(human_age "$(file_age "$cache")")" "$C_RESET"
@@ -355,72 +491,125 @@ breakdown_section() {   # title, kind, total_tokens
   local got=0
   # No gauge and no heat colour here: a share of the window's tokens has no
   # ceiling to fill, so the visual language used for quota would mislead.
-  while IFS=$'\t' read -r _ name tok cost msgs pad; do
+  while IFS=$'\t' read -r _ name tok cost msgs pad priced; do
     [ -n "$name" ] || continue
     got=1
     share=$(awk -v t="$tok" -v a="$total" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
-    if awk -v c="$cost" 'BEGIN { exit !(c > 0) }'; then
+    if [ "${priced:-1}" = "1" ]; then
       printf '  %s %5.1f%%  %7s  %s$%.2f%s\n' \
         "${pad:-$name}" "$share" "$(human_tok "$tok")" "$C_DIM" "$cost" "$C_RESET"
     else
-      printf '  %s %5.1f%%  %7s\n' "${pad:-$name}" "$share" "$(human_tok "$tok")"
+      printf '  %s %5.1f%%  %7s  %sno published rate%s\n' \
+        "${pad:-$name}" "$share" "$(human_tok "$tok")" "$C_DIM" "$C_RESET"
     fi
   done < <(local_rows "$kind")
   [ "$got" = "1" ] || printf '  %sno activity in this window%s\n' "$C_DIM" "$C_RESET"
 }
 
-render() {
-  local force=${1:-0} cs xs ls
-  cs=$(ensure claude "$QUOTA_TTL" "$force")
-  xs=$(ensure codex  "$QUOTA_TTL" "$force")
-  ls=$(ensure local  "$LOCAL_TTL" "$force")
+render_account() {   # $1 = force, $2 = show labels (1/0)
+  local force=$1 labelled=$2 cs xs ls
 
-  printf '%s┌ AI Usage%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(date '+%H:%M:%S')" "$C_RESET"
-  quota_section "CLAUDE" "$C_CYAN"    "$cs" claude_rows claude_note "$CACHE_DIR/claude.json" claude_hint
-  printf '\n'
-  quota_section "CODEX"  "$C_MAGENTA" "$xs" codex_rows  codex_note  "$CACHE_DIR/codex.json" codex_hint
-  printf '\n'
-
-  local range total ttok tcost tmsgs
-  [ "$DAYS" = "1" ] && range="today" || range="${DAYS}d"
-  IFS=$'\t' read -r _ _ tok cost msgs _ < <(local_rows TOTAL)
-  tok=${tok:-0}; cost=${cost:-0}; msgs=${msgs:-0}
-  if [ "$ls" = "missing" ]; then
-    printf ' %sBREAKDOWN%s %s(%s) scanning transcripts...%s\n' \
-      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
-  else
-    printf ' %sWHERE%s %s(%s - %s tok, ~$%.2f, %s msgs; $ estimated)%s\n' \
-      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$tok")" "$cost" "$msgs" "$C_RESET"
-    breakdown_section "" PROJ "$tok" | tail -n +2
+  if [ "$HAS_CLAUDE" = "1" ]; then
+    cs=$(ensure claude "$QUOTA_TTL" "$force")
+    quota_section "CLAUDE$([ "$labelled" = 1 ] && printf ' \302\267 %s' "$(claude_label)")" \
+      "$C_CYAN" "$cs" claude_rows claude_note "$(cache_file claude)" claude_hint
     printf '\n'
-    printf ' %sWHAT%s %s(%s - by model)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
-    breakdown_section "" MODEL "$tok" | tail -n +2
-
-    local cxtok cxmsgs
-    IFS=$'\t' read -r _ _ cxtok _ cxmsgs _ < <(local_rows CODEX_TOTAL)
-    if [ "${cxtok:-0}" -gt 0 ]; then
-      printf '\n'
-      printf ' %sCODEX%s %s(%s - %s tok, %s msgs; no public rate, tokens only)%s\n' \
-        "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$cxtok")" "${cxmsgs:-0}" "$C_RESET"
-      breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2
-      breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2
-    fi
   fi
 
-  [ "$ONCE" = "0" ] && printf '\n %s[q] quit  [r] refetch  [d] %s  -  api %ss, local %ss%s\n' \
+  if [ "$HAS_CODEX" = "1" ]; then
+    xs=$(ensure codex "$QUOTA_TTL" "$force")
+    quota_section "CODEX$([ "$labelled" = 1 ] && printf ' \302\267 %s' "$(codex_label)")" \
+      "$C_MAGENTA" "$xs" codex_rows codex_note "$(cache_file codex)" codex_hint
+    printf '\n'
+  fi
+
+  [ "$HAS_CLAUDE" = "1" ] || return 0
+  ls=$(ensure local "$LOCAL_TTL" "$force")
+
+  local range tok cost msgs priced suffix=""
+  [ "$DAYS" = "1" ] && range="today" || range="${DAYS}d"
+  [ "$labelled" = 1 ] && suffix=" $(printf '\302\267') $(claude_label)"
+  if [ "$ls" = "missing" ]; then
+    printf ' %sBREAKDOWN%s %s(%s%s) scanning transcripts...%s\n\n' \
+      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$C_RESET"
+    return 0
+  fi
+
+  IFS=$'\t' read -r _ _ tok cost msgs _ priced < <(local_rows TOTAL)
+  tok=${tok:-0}; cost=${cost:-0}; msgs=${msgs:-0}
+  local costnote="\$ estimated"
+  if [ "${priced:-1}" != "1" ]; then
+    costnote="\$ is a floor - $(local_rows UNPRICED | wc -l | tr -d ' ') model(s) have no published rate"
+  fi
+  printf ' %sWHERE%s %s(%s%s - %s tok, ~$%.2f, %s msgs; %s)%s\n' \
+    "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$(human_tok "$tok")" "$cost" "$msgs" \
+    "$costnote" "$C_RESET"
+  breakdown_section "" PROJ "$tok" | tail -n +2
+  printf '\n'
+  printf ' %sWHAT%s %s(%s%s - by model)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$C_RESET"
+  breakdown_section "" MODEL "$tok" | tail -n +2
+
+  local cxtok cxmsgs
+  IFS=$'\t' read -r _ _ cxtok _ cxmsgs _ < <(local_rows CODEX_TOTAL)
+  if [ "${cxtok:-0}" -gt 0 ]; then
+    printf '\n'
+    printf ' %sCODEX%s %s(%s - %s tok, %s msgs; no public rate, tokens only)%s\n' \
+      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$cxtok")" "${cxmsgs:-0}" "$C_RESET"
+    breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2
+    breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2
+  fi
+  printf '\n'
+}
+
+render() {
+  local force=${1:-0} labelled=0 first=1
+  [ "$(account_count)" -gt 1 ] && labelled=1
+
+  printf '%s\342\224\214 AI Usage%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(date '+%H:%M:%S')" "$C_RESET"
+  while IFS=$'\t' read -r id label claude codex; do
+    [ -n "$id" ] || continue
+    [ "$first" = 1 ] || printf '%s%s%s\n\n' "$C_DIM" "  ────────────────────────────────────────" "$C_RESET"
+    first=0
+    with_account "$id" "$label" "$claude" "$codex"
+    render_account "$force" "$labelled"
+  done < <(load_accounts)
+
+  [ "$ONCE" = "0" ] && printf ' %s[q] quit  [r] refetch  [d] %s  -  api %ss, local %ss%s\n' \
     "$C_DIM" "$([ "$DAYS" = "1" ] && echo "7 days" || echo "today")" "$QUOTA_TTL" "$LOCAL_TTL" "$C_RESET"
   return 0
 }
 
 # --------------------------------------------------------------- report ----
-# One machine-readable snapshot, so a GUI front end does not have to re-derive
-# any of the parsing, pricing or aggregation done here.
-report() {
-  ONCE=1
-  local cs xs limits
+# One machine-readable snapshot per account, so a GUI front end never has to
+# re-derive the parsing, pricing or aggregation done here.
+breakdown_for() {   # $1 = days
+  DAYS=$1
+  [ "$HAS_CLAUDE" = "1" ] && ensure local "$LOCAL_TTL" 0 >/dev/null
+  rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+         messages: (.[4] | tonumber), priced: ((.[6] // "1") == "1")})'; }
+  total_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
+      | if length == 0 then {tokens: 0, cost: 0, messages: 0, priced: true}
+        else (.[0] | {tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+                      messages: (.[4] | tonumber),
+                      priced: ((.[6] // "1") == "1")}) end'; }
+  jq -n \
+    --argjson projects "$(local_rows PROJ | rows_json)" \
+    --argjson models "$(local_rows MODEL | rows_json)" \
+    --argjson total "$(local_rows TOTAL | total_json)" \
+    --argjson unpriced "$(local_rows UNPRICED | jq -R -s 'split("\n")
+        | map(select(length > 0) | split("\t")[1])')" \
+    --argjson cx_projects "$(local_rows CODEX_PROJ | rows_json)" \
+    --argjson cx_models "$(local_rows CODEX_MODEL | rows_json)" \
+    --argjson cx_total "$(local_rows CODEX_TOTAL | total_json)" \
+    '{claude: {total: $total, projects: $projects, models: $models, unpriced: $unpriced},
+      codex:  {total: $cx_total, projects: $cx_projects, models: $cx_models, unpriced: []}}'
+}
 
-  cs=$(ensure claude "$QUOTA_TTL" 0)
-  xs=$(ensure codex  "$QUOTA_TTL" 0)
+account_report() {
+  local limits cs=missing xs=missing
+  [ "$HAS_CLAUDE" = "1" ] && cs=$(ensure claude "$QUOTA_TTL" 0)
+  [ "$HAS_CODEX"  = "1" ] && xs=$(ensure codex  "$QUOTA_TTL" 0)
 
   limits=$({
     [ "$cs" != "missing" ] && claude_rows | awk '{ print "claude\t" $0 }'
@@ -429,43 +618,33 @@ report() {
       | {source: .[0], label: .[1], percent: (.[2] | tonumber),
          resets_at: (.[3] // "0" | tonumber)})')
 
-  # One snapshot carries every range the front ends show, so they never have to
-  # re-run the tool to switch between them.
-  breakdown_for() {
-    DAYS=$1
-    ensure local "$LOCAL_TTL" 0 >/dev/null
-    local projects models total
-    rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
-        | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
-           messages: (.[4] | tonumber)})'; }
-    total_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
-        | if length == 0 then {tokens: 0, cost: 0, messages: 0}
-          else (.[0] | {tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
-                        messages: (.[4] | tonumber)}) end'; }
-    jq -n \
-      --argjson projects "$(local_rows PROJ | rows_json)" \
-      --argjson models "$(local_rows MODEL | rows_json)" \
-      --argjson total "$(local_rows TOTAL | total_json)" \
-      --argjson cx_projects "$(local_rows CODEX_PROJ | rows_json)" \
-      --argjson cx_models "$(local_rows CODEX_MODEL | rows_json)" \
-      --argjson cx_total "$(local_rows CODEX_TOTAL | total_json)" \
-      '{claude: {total: $total, projects: $projects, models: $models},
-        codex:  {total: $cx_total, projects: $cx_projects, models: $cx_models}}'
-  }
-
-  local today week
-  today=$(breakdown_for 1)
-  week=$(breakdown_for 7)
-
   jq -n \
-    --argjson limits "$limits" --argjson today "$today" --argjson week "$week" \
-    --arg claude_err "$([ "$cs" = missing ] && claude_hint)" \
-    --arg codex_err "$([ "$xs" = missing ] && codex_hint)" \
-    --argjson now "$(date +%s)" \
-    '{generated_at: $now, limits: $limits,
-      breakdowns: {today: $today, week: $week},
+    --arg id "$ACCT_ID" \
+    --arg claude_label "$([ "$HAS_CLAUDE" = "1" ] && claude_label)" \
+    --arg codex_label "$([ "$HAS_CODEX" = "1" ] && codex_label)" \
+    --argjson has_claude "$HAS_CLAUDE" --argjson has_codex "$HAS_CODEX" \
+    --argjson limits "$limits" \
+    --argjson today "$(breakdown_for 1)" --argjson week "$(breakdown_for 7)" \
+    --arg claude_err "$([ "$cs" = "missing" ] && [ "$HAS_CLAUDE" = "1" ] && claude_hint)" \
+    --arg codex_err "$([ "$xs" = "missing" ] && [ "$HAS_CODEX" = "1" ] && codex_hint)" \
+    '{id: $id, claude_label: $claude_label, codex_label: $codex_label,
+      has_claude: ($has_claude == 1), has_codex: ($has_codex == 1),
+      limits: $limits, breakdowns: {today: $today, week: $week},
       errors: {claude: (if $claude_err == "" then null else $claude_err end),
                codex:  (if $codex_err  == "" then null else $codex_err  end)}}'
+}
+
+report() {
+  ONCE=1
+  local tmp; tmp=$(mktemp)
+  while IFS=$'\t' read -r id label claude codex; do
+    [ -n "$id" ] || continue
+    with_account "$id" "$label" "$claude" "$codex"
+    account_report >> "$tmp"
+  done < <(load_accounts)
+  jq -n --argjson now "$(date +%s)" --argjson accounts "$(jq -s '.' "$tmp")" \
+    '{generated_at: $now, accounts: $accounts}'
+  rm -f "$tmp"
 }
 
 # -------------------------------------------------------------- menubar ----
@@ -485,62 +664,64 @@ MB_MONO="font=Menlo size=12"
 MB_HEAD="color=#8b949e size=11"
 
 menubar() {
-  ONCE=1   # short-lived process: fetch synchronously rather than in background
-  # SwiftBar renders plain text and colours a whole line at a time, so drop the
-  # ANSI ramp and let each row take one colour from its own percentage.
-  COLOR=0; WIDE=0
-  local cs xs ls now rows="" top pct
-  cs=$(ensure claude "$QUOTA_TTL" 0)
-  xs=$(ensure codex  "$QUOTA_TTL" 0)
-  ls=$(ensure local  "$LOCAL_TTL" 0)
+  ONCE=1          # short-lived process: fetch synchronously
+  COLOR=0; WIDE=0 # SwiftBar colours a whole line at a time, not runs of text
+
+  local labelled=0 rows="" body="" now top pct
+  [ "$(account_count)" -gt 1 ] && labelled=1
   now=$(date +%s)
 
-  [ "$cs" != "missing" ] && rows=$(claude_rows | awk '{ print "CLAUDE\t" $0 }')
-  if [ "$xs" != "missing" ]; then
-    local cx; cx=$(codex_rows | awk '{ print "CODEX\t" $0 }')
-    rows=$(printf '%s\n%s' "$rows" "$cx")
-  fi
-  rows=$(printf '%s\n' "$rows" | grep -v '^$')
+  while IFS=$'\t' read -r id label claude codex; do
+    [ -n "$id" ] || continue
+    with_account "$id" "$label" "$claude" "$codex"
+    local cs xs mine
+    if [ "$HAS_CLAUDE" = "1" ]; then
+      cs=$(ensure claude "$QUOTA_TTL" 0)
+      body="$body$(printf 'H\tCLAUDE%s\t\t\n' \
+        "$([ "$labelled" = 1 ] && printf ' - %s' "$(claude_label)")")"$'\n'
+      if [ "$cs" = "missing" ]; then
+        body="$body$(printf 'E\t%s\t\t\n' "$(claude_hint)")"$'\n'
+      else
+        mine=$(claude_rows)
+        body="$body$(printf '%s\n' "$mine" | awk 'NF { print "R\t" $0 }')"$'\n'
+        rows="$rows$mine"$'\n'
+      fi
+    fi
+    if [ "$HAS_CODEX" = "1" ]; then
+      xs=$(ensure codex "$QUOTA_TTL" 0)
+      body="$body$(printf 'H\tCODEX%s\t\t\n' \
+        "$([ "$labelled" = 1 ] && printf ' - %s' "$(codex_label)")")"$'\n'
+      if [ "$xs" = "missing" ]; then
+        body="$body$(printf 'E\t%s\t\t\n' "$(codex_hint)")"$'\n'
+      else
+        mine=$(codex_rows)
+        body="$body$(printf '%s\n' "$mine" | awk 'NF { print "R\t" $0 }')"$'\n'
+        rows="$rows$mine"$'\n'
+      fi
+    fi
+  done < <(load_accounts)
 
-  # Title: whichever limit is closest to its ceiling.
-  top=$(printf '%s\n' "$rows" | awk -F'\t' '$3 > m { m = $3; line = $0 } END { print line }')
-  pct=$(printf '%s' "$top" | cut -f3)
+  # Title: whichever limit across every account sits closest to its ceiling.
+  top=$(printf '%s' "$rows" | awk -F'\t' 'NF && $2 > m { m = $2; line = $0 } END { print line }')
+  pct=$(printf '%s' "$top" | cut -f2)
   if [ -n "$pct" ]; then
     printf '%s %.0f%% | color=%s font=Menlo\n' "$(bar "$pct" 5)" "$pct" "$(hex_for "$pct")"
   else
-    printf '\342\227\217 -- | color=#8b949e\n'
+    printf '%s -- | color=#8b949e font=Menlo\n' "$(bar 0 5)"
   fi
   printf -- '---\n'
 
-  local src label p reset shown=""
-  while IFS=$'\t' read -r src label p reset; do
-    [ -n "$src" ] || continue
-    if [ "$src" != "$shown" ]; then
-      [ -n "$shown" ] && printf -- '---\n'
-      printf '%s | %s\n' "$src" "$MB_HEAD"
-      shown=$src
-    fi
-    local trail=""
-    [ "${reset:-0}" -gt 0 ] && trail=$(countdown $(( reset - now )))
-    printf '%-8s %s %5.1f%%  %-12s | %s color=%s\n' \
-      "$label" "$(bar "$p" 12)" "$p" "$trail" "$MB_MONO" "$(hex_for "$p")"
-  done < <(printf '%s\n' "$rows")
-
-  [ "$cs" = "missing" ] && printf 'CLAUDE: %s | color=#f0883e size=11\n' "$(claude_hint)"
-  [ "$xs" = "missing" ] && printf 'CODEX: %s | color=#f0883e size=11\n' "$(codex_hint)"
-
-  if [ "$ls" != "missing" ]; then
-    local tok cost msgs name ttok tcost share
-    IFS=$'\t' read -r _ _ tok cost msgs _ < <(local_rows TOTAL)
-    printf -- '---\n'
-    printf 'TODAY  %s tok  ~$%.2f  %s msgs | %s\n' "$(human_tok "${tok:-0}")" "${cost:-0}" "${msgs:-0}" "$MB_HEAD"
-    while IFS=$'\t' read -r _ name ttok tcost _ _; do
-      [ -n "$name" ] || continue
-      share=$(awk -v t="$ttok" -v a="${tok:-0}" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
-      printf '%-24.24s %5.1f%%  %7s | %s\n' \
-        "$name" "$share" "$(human_tok "$ttok")" "$MB_MONO"
-    done < <(local_rows PROJ | head -3)
-  fi
+  printf '%s' "$body" | while IFS=$'\t' read -r kind a b c; do
+    case "$kind" in
+      H) printf '%s | %s\n' "$a" "$MB_HEAD" ;;
+      E) printf '  %s | color=#f0883e size=11\n' "$a" ;;
+      R)
+        trail=""
+        [ "${c:-0}" -gt 0 ] 2>/dev/null && trail=$(countdown $(( c - now )))
+        printf '%-8s %s %5.1f%%  %-12s | %s color=%s\n' \
+          "$a" "$(bar "$b" 12)" "$b" "$trail" "$MB_MONO" "$(hex_for "$b")" ;;
+    esac
+  done
 
   printf -- '---\n'
   printf 'Open dashboard | bash="%s" terminal=true\n' "$AI_USAGE_ROOT/bin/ai-usage"
@@ -561,7 +742,7 @@ self_test() {
   }
 
   echo "self-test: claude quota parsing"
-  cat > "$tmp/claude.json" <<'J'
+  cat > "$tmp/a0-claude.json" <<'J'
 {"limits":[
  {"kind":"session","percent":7,"severity":"normal","resets_at":"2026-09-15T05:20:00.270019+00:00","scope":null},
  {"kind":"weekly_all","percent":56,"severity":"normal","resets_at":"2026-09-18T02:00:00.270043+00:00","scope":null},
@@ -576,7 +757,7 @@ J
   check "resets_at -> epoch"   "$(claude_rows | sed -n 1p | cut -f3)" "1789449600"
 
   echo "self-test: codex quota parsing"
-  cat > "$tmp/codex.json" <<'J'
+  cat > "$tmp/a0-codex.json" <<'J'
 {"plan_type":"team","rate_limit":{"primary_window":{"used_percent":23,"limit_window_seconds":604800,"reset_at":1789968528},
  "secondary_window":{"used_percent":4,"limit_window_seconds":18000,"reset_at":1789450000}},
  "credits":{"unlimited":false,"balance":null},"rate_limit_reset_credits":{"available_count":3},
@@ -659,6 +840,33 @@ J
   check "claude rows still emitted alongside" \
     "$(printf '%s' "$wired" | awk -F"\t" '$1=="TOTAL"{print $3}')" "15000"
 
+  echo "self-test: accounts"
+  printf '%s' '{"accounts":[{"claude":"~/.claude","codex":"~/.codex"},
+                            {"label":"work","codex":"/tmp/cx-work"}]}' > "$tmp/accounts.json"
+  local saved_accounts=$ACCOUNTS_FILE
+  ACCOUNTS_FILE=$tmp/accounts.json
+  check "two accounts parsed"     "$(account_count)" "2"
+  check "empty field keeps its slot" \
+    "$(load_accounts | sed -n 2p | cut -f1,2,3)" "$(printf 'a1\twork\t-')"
+  with_account $(load_accounts | sed -n 1p | tr '\t' ' ')
+  check "tilde expanded"          "$CLAUDE_DIR" "$HOME/.claude/projects"
+  check "default account may use the keychain" "$USE_KEYCHAIN" "1"
+  with_account $(load_accounts | sed -n 2p | tr '\t' ' ')
+  check "claude absent for a codex-only account" "$HAS_CLAUDE" "0"
+  check "codex present"           "$HAS_CODEX" "1"
+  check "non-default account never reads the keychain" "$USE_KEYCHAIN" "0"
+  check "caches are namespaced"   "$(cache_file codex)" "$tmp/a1-codex.json"
+  ACCOUNTS_FILE=$saved_accounts
+  ACCT_ID=a0; USE_KEYCHAIN=1
+
+  echo "self-test: rate limiting"
+  ACCT_ID=rl
+  printf '429 %s\n' "$(date +%s)" > "$tmp/rl-claude.status"
+  check "a 429 is named, not hidden" \
+    "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_hint | cut -d- -f1)" "rate limited by the usage API "
+  rm -f "$tmp/rl-claude.status"
+  ACCT_ID=a0
+
   echo "self-test: display helpers"
   check "human_tok 1500000"  "$(human_tok 1500000)"  "1.5M"
   check "countdown 262351"   "$(countdown 262351)"   "3d 00:52:31"
@@ -680,9 +888,20 @@ case "$MODE" in
   menubar)  menubar; exit 0 ;;
   report)   report 0; exit 0 ;;
   json)
-    ensure claude "$QUOTA_TTL" 1 >/dev/null; ensure codex "$QUOTA_TTL" 1 >/dev/null
-    jq -n --slurpfile c "$CACHE_DIR/claude.json" --slurpfile x "$CACHE_DIR/codex.json" \
-      '{claude: ($c[0] // null), codex: ($x[0] // null)}' 2>/dev/null
+    ONCE=1
+    tmp=$(mktemp)
+    while IFS=$'\t' read -r id label claude codex; do
+      [ -n "$id" ] || continue
+      with_account "$id" "$label" "$claude" "$codex"
+      [ "$HAS_CLAUDE" = "1" ] && ensure claude "$QUOTA_TTL" 0 >/dev/null
+      [ "$HAS_CODEX"  = "1" ] && ensure codex  "$QUOTA_TTL" 0 >/dev/null
+      jq -n --arg id "$ACCT_ID" \
+        --slurpfile c "$(cache_file claude)" --slurpfile x "$(cache_file codex)" \
+        '{id: $id, claude: ($c[0] // null), codex: ($x[0] // null)}' \
+        2>/dev/null >> "$tmp"
+    done < <(load_accounts)
+    jq -s '{accounts: .}' "$tmp"
+    rm -f "$tmp"
     exit 0 ;;
 esac
 

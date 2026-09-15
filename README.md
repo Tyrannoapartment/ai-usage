@@ -50,12 +50,20 @@ stored on your machine:
 Each token is sent only to its own vendor, over HTTPS, and nothing is written
 anywhere except a quota cache under `~/.cache/ai-usage/`.
 
-The **WHERE** and **WHAT** sections are aggregated from your local Claude Code
-transcripts in `~/.claude/projects/`. Their token counts are exact — they are
-read straight out of each message's `usage` record, de-duplicated by message and
-request id. **Only the dollar column is an estimate:** subscription plans report
-no dollar figures, so tokens are priced at public API rates. Treat it as a
-relative signal, not a bill.
+The **WHERE** and **WHAT** sections are aggregated from local transcripts —
+`~/.claude/projects/` for Claude, `~/.codex/sessions/` for Codex. Their token
+counts are exact: read straight out of each turn's usage record, de-duplicated
+by message and request id.
+
+**Only the dollar column is an estimate**, and it is conservative. Subscription
+plans report no dollar figures, so Claude tokens are priced at public API rates.
+A model with no published rate contributes its tokens but no cost and is marked
+`no published rate`, which makes the total a floor rather than a guess — the
+tool will not invent a price for a model it does not know. Codex publishes no
+per-token rate for subscription plans at all, so its rows carry tokens only.
+
+If an endpoint answers `429`, the tool says so and stops calling it for five
+minutes rather than hammering through a rate limit.
 
 ## Install
 
@@ -150,6 +158,32 @@ Percentages run along a seven-stop ramp from green to red, and each bar is
 coloured cell by cell, so a bar gets hotter as it fills rather than flipping
 between three states. Terminals without 256-color support fall back to three
 steps; `NO_COLOR` or a non-TTY drops color entirely.
+
+## Several accounts
+
+People who keep more than one Claude or Codex login — each in its own config
+directory, the way `CLAUDE_CONFIG_DIR` and `CODEX_HOME` work — can list them in
+`~/.config/ai-usage/accounts.json`:
+
+```json
+{
+  "accounts": [
+    { "claude": "~/.claude", "codex": "~/.codex" },
+    { "label": "work", "codex": "~/.codex-work" },
+    { "label": "side", "claude": "~/.claude-side" }
+  ]
+}
+```
+
+Each entry may carry `claude`, `codex`, or both. Labels are optional: Codex is
+named by the signed-in email its API reports, Claude by its plan. With no file,
+the standard pair is the only account and nothing on screen changes.
+
+One caveat: the macOS Keychain holds exactly one Claude Code credential, so only
+the default `~/.claude` account reads it. Other accounts use the
+`.credentials.json` inside their own directory, which Claude Code may not
+refresh — if one goes stale, run `claude` once with `CLAUDE_CONFIG_DIR` pointed
+at it.
 
 ## Known limits
 

@@ -25,18 +25,21 @@ struct Entry: Decodable {
     let tokens: Double
     let cost: Double
     let messages: Int
+    let priced: Bool
 }
 
 struct Total: Decodable {
     let tokens: Double
     let cost: Double
     let messages: Int
+    let priced: Bool
 }
 
 struct Breakdown: Decodable {
     let total: Total
     let projects: [Entry]
     let models: [Entry]
+    let unpriced: [String]
 }
 
 /// One reporting window, split by the tool that produced the tokens.
@@ -55,15 +58,34 @@ struct Errors: Decodable {
     let codex: String?
 }
 
-struct Report: Decodable {
-    let generatedAt: Double
+/// One signed-in pair of tools. People who keep several Claude or Codex
+/// logins get one of these per account.
+struct Account: Decodable {
+    let id: String
+    let claudeLabel: String
+    let codexLabel: String
+    let hasClaude: Bool
+    let hasCodex: Bool
     let limits: [Limit]
     let breakdowns: Windows
     let errors: Errors
 
     enum CodingKeys: String, CodingKey {
+        case id, limits, breakdowns, errors
+        case claudeLabel = "claude_label"
+        case codexLabel = "codex_label"
+        case hasClaude = "has_claude"
+        case hasCodex = "has_codex"
+    }
+}
+
+struct Report: Decodable {
+    let generatedAt: Double
+    let accounts: [Account]
+
+    enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
-        case limits, breakdowns, errors
+        case accounts
     }
 }
 
@@ -240,7 +262,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
     /// The title shows whichever limit sits closest to its ceiling.
     private var mostUrgent: Limit? {
-        report?.limits.max { $0.percent < $1.percent }
+        report?.accounts.flatMap(\.limits).max { $0.percent < $1.percent }
     }
 
     private func render() {
@@ -353,7 +375,10 @@ final class Controller: NSObject, NSMenuDelegate {
         var summary = title + "   " + Format.tokens(claude.total.tokens + codex.total.tokens)
             + " tok"
         if claude.total.cost > 0 {
-            summary += String(format: "   ~$%.2f", claude.total.cost)
+            // A model with no published rate contributes tokens but no cost,
+            // so the figure is a floor rather than an estimate.
+            summary += String(format: claude.total.priced ? "   ~$%.2f" : "   >$%.2f",
+                              claude.total.cost)
         }
         menu.addItem(header(summary))
 
@@ -378,26 +403,37 @@ final class Controller: NSObject, NSMenuDelegate {
 
         if let report {
             let now = Date().timeIntervalSince1970
-            for source in ["claude", "codex"] {
-                let limits = report.limits.filter { $0.source == source }
-                let message = source == "claude" ? report.errors.claude : report.errors.codex
-                if limits.isEmpty && message == nil { continue }
-                menu.addItem(header(source.uppercased()))
-                if let message {
-                    menu.addItem(row("  " + message, color: .systemOrange))
+            let labelled = report.accounts.count > 1
+            for account in report.accounts {
+                for source in ["claude", "codex"] {
+                    let isClaude = source == "claude"
+                    guard isClaude ? account.hasClaude : account.hasCodex else { continue }
+                    let limits = account.limits.filter { $0.source == source }
+                    let message = isClaude ? account.errors.claude : account.errors.codex
+                    var title = source.uppercased()
+                    if labelled {
+                        let label = isClaude ? account.claudeLabel : account.codexLabel
+                        if !label.isEmpty { title += "  \(label)" }
+                    }
+                    menu.addItem(header(title))
+                    if let message {
+                        menu.addItem(row("  " + message, color: .systemOrange))
+                    }
+                    for limit in limits {
+                        let left = limit.resetsAt > 0
+                            ? Format.countdown(limit.resetsAt - now) : ""
+                        menu.addItem(gaugeRow(label: limit.label,
+                                              percent: limit.percent,
+                                              trailing: left))
+                    }
+                    menu.addItem(.separator())
                 }
-                for limit in limits {
-                    let left = limit.resetsAt > 0
-                        ? Format.countdown(limit.resetsAt - now) : ""
-                    menu.addItem(gaugeRow(label: limit.label,
-                                          percent: limit.percent,
-                                          trailing: left))
-                }
-                menu.addItem(.separator())
-            }
 
-            renderWindow("TODAY", report.breakdowns.today)
-            renderWindow("LAST 7 DAYS", report.breakdowns.week)
+                let suffix = labelled && !account.claudeLabel.isEmpty
+                    ? "  \(account.claudeLabel)" : ""
+                renderWindow("TODAY" + suffix, account.breakdowns.today)
+                renderWindow("LAST 7 DAYS" + suffix, account.breakdowns.week)
+            }
         }
 
         let dashboard = NSMenuItem(title: "Open dashboard", action: #selector(openDashboard),
