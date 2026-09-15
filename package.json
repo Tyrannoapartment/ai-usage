@@ -1,6 +1,6 @@
 {
   "name": "@tyrannoapartment/ai-usage",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Live terminal dashboard for Claude and Codex quota usage, with a per-project and per-model breakdown",
   "keywords": ["claude", "codex", "quota", "usage", "rate-limit", "tui", "cli", "dashboard"],
   "homepage": "https://github.com/Tyrannoapartment/ai-usage#readme",
@@ -14,7 +14,7 @@
   "bin": {
     "ai-usage": "bin/ai-usage"
   },
-  "files": ["bin", "lib", "test", "README.md", "LICENSE"],
+  "files": ["bin", "lib", "test", "extras", "menubar", "README.md", "LICENSE"],
   "os": ["darwin"],
   "scripts": {
     "test": "./test/run-tests.sh"

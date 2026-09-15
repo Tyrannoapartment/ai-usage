@@ -87,6 +87,7 @@ ai-usage --days 7        # breakdown over 7 days instead of today
 ai-usage --once          # print one frame and exit (pipes, cron, status bars)
 ai-usage --json          # raw merged quota JSON
 ai-usage --menubar       # one SwiftBar/xbar frame
+ai-usage --report        # JSON snapshot (what the menu bar app reads)
 ai-usage --self-test     # run the test suite
 ```
 
@@ -104,20 +105,35 @@ Environment overrides: `AI_USAGE_CLAUDE_CREDS`, `AI_USAGE_CODEX_CREDS`,
 
 ## Menu bar
 
-The same numbers in the macOS menu bar, via [SwiftBar](https://swiftbar.app):
+Two ways, both optional.
+
+**Native app** — no third-party dependency, countdowns tick every second while
+the menu is open, and the status item draws a real gauge:
+
+```sh
+./menubar/build.sh --install      # builds AIUsage.app into /Applications
+open /Applications/AIUsage.app
+```
+
+It compiles one Swift file with `swiftc`; no Xcode project, no App Store, and
+nothing to notarize because the binary never leaves the machine that built it.
+Add it to System Settings → General → Login Items to have it start with the Mac.
+
+**SwiftBar plugin** — if you already run SwiftBar or xbar:
 
 ```sh
 brew install --cask swiftbar
 ln -s "$(brew --prefix)/share/ai-usage/ai-usage.30s.sh" ~/SwiftBar/ai-usage.30s.sh
 ```
 
-The title shows whichever limit is closest to its ceiling — one number, coloured
-on the same ramp, so a glance tells you whether anything needs attention. The
-dropdown carries every limit with its countdown, today's top projects, and a
-"Open dashboard" item that launches the full view in a terminal.
+Either way the title shows whichever limit is closest to its ceiling — one
+number, coloured on the same ramp, so a glance tells you whether anything needs
+attention. The dropdown carries every limit with its countdown and today's
+busiest sessions.
 
-`ai-usage --menubar` prints one frame in SwiftBar/xbar format, so the plugin
-itself is a three-line wrapper; xbar works too.
+`ai-usage --menubar` prints a SwiftBar/xbar frame and `ai-usage --report` prints
+a JSON snapshot, which is what the app consumes; neither re-implements any of
+the parsing or pricing.
 
 ## Colors
 

@@ -19,6 +19,7 @@
 #   ai-usage --once       print one frame and exit
 #   ai-usage --json       raw merged quota JSON
 #   ai-usage --menubar    one SwiftBar/xbar frame (see extras/)
+#   ai-usage --report     one JSON snapshot: limits + breakdown (for the app)
 #   ai-usage --self-test  verify parsing, colors and aggregation
 #
 # Options: -i SECONDS screen redraw, --ttl SECONDS quota reuse window
@@ -63,6 +64,7 @@ while [ $# -gt 0 ]; do
     --once)        ONCE=1; shift ;;
     --json)        MODE=json; shift ;;
     --menubar)     MODE=menubar; shift ;;
+    --report)      MODE=report; shift ;;
     --self-test)   MODE=selftest; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -394,6 +396,46 @@ render() {
   return 0
 }
 
+# --------------------------------------------------------------- report ----
+# One machine-readable snapshot, so a GUI front end does not have to re-derive
+# any of the parsing, pricing or aggregation done here.
+report() {
+  ONCE=1
+  local cs xs ls limits projects models total range
+  cs=$(ensure claude "$QUOTA_TTL" "${1:-0}")
+  xs=$(ensure codex  "$QUOTA_TTL" "${1:-0}")
+  ls=$(ensure local  "$LOCAL_TTL" "${1:-0}")
+  [ "$DAYS" = "1" ] && range=today || range="${DAYS}d"
+
+  limits=$({
+    [ "$cs" != "missing" ] && claude_rows | awk '{ print "claude\t" $0 }'
+    [ "$xs" != "missing" ] && codex_rows  | awk '{ print "codex\t"  $0 }'
+  } | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {source: .[0], label: .[1], percent: (.[2] | tonumber),
+         resets_at: (.[3] // "0" | tonumber)})')
+
+  rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+         messages: (.[4] | tonumber)})'; }
+  projects=$(local_rows PROJ  | rows_json)
+  models=$(local_rows MODEL | rows_json)
+  total=$(local_rows TOTAL | jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
+      | if length == 0 then {tokens: 0, cost: 0, messages: 0}
+        else (.[0] | {tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+                      messages: (.[4] | tonumber)}) end')
+
+  jq -n \
+    --argjson limits "$limits" --argjson projects "$projects" \
+    --argjson models "$models" --argjson total "$total" \
+    --arg range "$range" --arg claude_err "$([ "$cs" = missing ] && claude_hint)" \
+    --arg codex_err "$([ "$xs" = missing ] && codex_hint)" \
+    --argjson now "$(date +%s)" \
+    '{generated_at: $now, limits: $limits,
+      breakdown: {range: $range, total: $total, projects: $projects, models: $models},
+      errors: {claude: (if $claude_err == "" then null else $claude_err end),
+               codex:  (if $codex_err  == "" then null else $codex_err  end)}}'
+}
+
 # -------------------------------------------------------------- menubar ----
 # SwiftBar/xbar output: the first line is the menu bar title, everything after
 # the first "---" is the dropdown. See extras/ai-usage.30s.sh.
@@ -463,8 +505,8 @@ menubar() {
     while IFS=$'\t' read -r _ name ttok tcost _ _; do
       [ -n "$name" ] || continue
       share=$(awk -v t="$ttok" -v a="${tok:-0}" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
-      printf '%-20.20s %s %5.1f%%  %7s | %s color=%s\n' \
-        "$name" "$(bar "$share" 8)" "$share" "$(human_tok "$ttok")" "$MB_MONO" "$(hex_for "$share")"
+      printf '%-24.24s %5.1f%%  %7s | %s\n' \
+        "$name" "$share" "$(human_tok "$ttok")" "$MB_MONO"
     done < <(local_rows PROJ | head -3)
   fi
 
@@ -585,6 +627,7 @@ J
 case "$MODE" in
   selftest) self_test; exit $? ;;
   menubar)  menubar; exit 0 ;;
+  report)   report 0; exit 0 ;;
   json)
     ensure claude "$QUOTA_TTL" 1 >/dev/null; ensure codex "$QUOTA_TTL" 1 >/dev/null
     jq -n --slurpfile c "$CACHE_DIR/claude.json" --slurpfile x "$CACHE_DIR/codex.json" \
