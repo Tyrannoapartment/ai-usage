@@ -115,12 +115,17 @@ Two ways, both optional.
 the menu is open, and the status item draws a real gauge:
 
 ```sh
-./menubar/build.sh --install      # builds AIUsage.app into /Applications
-open /Applications/AIUsage.app
+brew install --cask Tyrannoapartment/tap/ai-usage-app
 ```
 
-It compiles one Swift file with `swiftc`; no Xcode project, no App Store, and
-nothing to notarize because the binary never leaves the machine that built it.
+Signed with a Developer ID and notarized by Apple, so it opens without a
+Gatekeeper prompt. To build it yourself instead — one Swift file, `swiftc`, no
+Xcode project:
+
+```sh
+./menubar/build.sh --install      # builds AIUsage.app into /Applications
+```
+
 Add it to System Settings → General → Login Items to have it start with the Mac.
 
 **SwiftBar plugin** — if you already run SwiftBar or xbar:

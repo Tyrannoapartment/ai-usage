@@ -32,13 +32,11 @@ jobs:
         env:
           NOTARY: ${{ secrets.NOTARY_API_KEY }}
           NPM: ${{ secrets.NPM_TOKEN }}
-          TAP: ${{ secrets.TAP_TOKEN }}
         run: |
           # The secrets context cannot be read from a step `if`, so each one is
           # reduced to a boolean output here.
           { [ -n "$NOTARY" ] && echo "notary=true" || echo "notary=false"
             [ -n "$NPM" ]    && echo "npm=true"    || echo "npm=false"
-            [ -n "$TAP" ]    && echo "tap=true"    || echo "tap=false"
           } >> "$GITHUB_OUTPUT"
 
       - name: Read the version
@@ -145,33 +143,6 @@ jobs:
           npm publish --access public || echo "already published at this version"
           rm -f ~/.npmrc
 
-      - name: Point the Homebrew tap at this release
-        if: steps.meta.outputs.publish == 'true' && steps.creds.outputs.tap == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
-        run: |
-          version=${{ steps.meta.outputs.version }}
-          tarball="https://github.com/${{ github.repository }}/archive/refs/tags/v${version}.tar.gz"
-          src_sha=$(curl -sSL "$tarball" | shasum -a 256 | cut -d' ' -f1)
-          app_sha=$(shasum -a 256 "AIUsage-${version}.zip" | cut -d' ' -f1)
-
-          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-tap.git" tap
-          cd tap
-          sed -i '' -E \
-            -e "s|/archive/refs/tags/v[0-9.]+\.tar\.gz|/archive/refs/tags/v${version}.tar.gz|" \
-            -e "s|sha256 \"[a-f0-9]+\"|sha256 \"${src_sha}\"|" \
-            Formula/ai-usage.rb
-          if [ -f Casks/ai-usage-app.rb ]; then
-            sed -i '' -E \
-              -e "s|version \"[0-9.]+\"|version \"${version}\"|" \
-              -e "s|sha256 \"[a-f0-9]+\"|sha256 \"${app_sha}\"|" \
-              Casks/ai-usage-app.rb
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git commit -aqm "ai-usage ${version}"; then
-            git push --quiet
-            echo "tap updated"
-          else
-            echo "tap already points at ${version}"
-          fi
+      # The tap is not updated from here: this org disables deploy keys, and a
+      # cross-repo PAT would grant far more than this needs. The tap polls for
+      # new releases and pushes with its own token instead.
