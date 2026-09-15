@@ -18,6 +18,7 @@
 #   ai-usage --days 7     breakdown over 7 days instead of today
 #   ai-usage --once       print one frame and exit
 #   ai-usage --json       raw merged quota JSON
+#   ai-usage --menubar    one SwiftBar/xbar frame (see extras/)
 #   ai-usage --self-test  verify parsing, colors and aggregation
 #
 # Options: -i SECONDS screen redraw, --ttl SECONDS quota reuse window
@@ -61,6 +62,7 @@ while [ $# -gt 0 ]; do
     --days)        DAYS=$2; shift 2 ;;
     --once)        ONCE=1; shift ;;
     --json)        MODE=json; shift ;;
+    --menubar)     MODE=menubar; shift ;;
     --self-test)   MODE=selftest; shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -392,6 +394,80 @@ render() {
   return 0
 }
 
+# -------------------------------------------------------------- menubar ----
+# SwiftBar/xbar output: the first line is the menu bar title, everything after
+# the first "---" is the dropdown. See extras/ai-usage.30s.sh.
+hex_for() { awk -v p="$1" 'BEGIN {
+  if (p < 20)      c = "#2ea043"
+  else if (p < 35) c = "#3fb950"
+  else if (p < 50) c = "#7bc96f"
+  else if (p < 65) c = "#d4a72c"
+  else if (p < 78) c = "#e3872b"
+  else if (p < 90) c = "#f0883e"
+  else             c = "#f85149"
+  print c }'; }
+
+MB_MONO="font=Menlo size=12"
+MB_HEAD="color=#8b949e size=11"
+
+menubar() {
+  ONCE=1   # short-lived process: fetch synchronously rather than in background
+  local cs xs ls now rows="" top pct
+  cs=$(ensure claude "$QUOTA_TTL" 0)
+  xs=$(ensure codex  "$QUOTA_TTL" 0)
+  ls=$(ensure local  "$LOCAL_TTL" 0)
+  now=$(date +%s)
+
+  [ "$cs" != "missing" ] && rows=$(claude_rows | awk '{ print "CLAUDE\t" $0 }')
+  if [ "$xs" != "missing" ]; then
+    local cx; cx=$(codex_rows | awk '{ print "CODEX\t" $0 }')
+    rows=$(printf '%s\n%s' "$rows" "$cx")
+  fi
+  rows=$(printf '%s\n' "$rows" | grep -v '^$')
+
+  # Title: whichever limit is closest to its ceiling.
+  top=$(printf '%s\n' "$rows" | awk -F'\t' '$3 > m { m = $3; line = $0 } END { print line }')
+  pct=$(printf '%s' "$top" | cut -f3)
+  if [ -n "$pct" ]; then
+    printf '\342\227\217 %.0f%% | color=%s\n' "$pct" "$(hex_for "$pct")"
+  else
+    printf '\342\227\217 -- | color=#8b949e\n'
+  fi
+  printf -- '---\n'
+
+  local src label p reset shown=""
+  while IFS=$'\t' read -r src label p reset; do
+    [ -n "$src" ] || continue
+    if [ "$src" != "$shown" ]; then
+      [ -n "$shown" ] && printf -- '---\n'
+      printf '%s | %s\n' "$src" "$MB_HEAD"
+      shown=$src
+    fi
+    local trail=""
+    [ "${reset:-0}" -gt 0 ] && trail=$(countdown $(( reset - now )))
+    printf '%-8s %5.1f%%  %-12s | %s color=%s\n' "$label" "$p" "$trail" "$MB_MONO" "$(hex_for "$p")"
+  done < <(printf '%s\n' "$rows")
+
+  [ "$cs" = "missing" ] && printf 'CLAUDE: %s | color=#f0883e size=11\n' "$(claude_hint)"
+  [ "$xs" = "missing" ] && printf 'CODEX: %s | color=#f0883e size=11\n' "$(codex_hint)"
+
+  if [ "$ls" != "missing" ]; then
+    local tok cost msgs name ttok tcost share
+    IFS=$'\t' read -r _ _ tok cost msgs _ < <(local_rows TOTAL)
+    printf -- '---\n'
+    printf 'TODAY  %s tok  ~$%.2f  %s msgs | %s\n' "$(human_tok "${tok:-0}")" "${cost:-0}" "${msgs:-0}" "$MB_HEAD"
+    while IFS=$'\t' read -r _ name ttok tcost _ _; do
+      [ -n "$name" ] || continue
+      share=$(awk -v t="$ttok" -v a="${tok:-0}" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
+      printf '%-20.20s %5.1f%%  %7s | %s\n' "$name" "$share" "$(human_tok "$ttok")" "$MB_MONO"
+    done < <(local_rows PROJ | head -3)
+  fi
+
+  printf -- '---\n'
+  printf 'Open dashboard | bash="%s" terminal=true\n' "$AI_USAGE_ROOT/bin/ai-usage"
+  printf 'Refresh | refresh=true\n'
+}
+
 # ------------------------------------------------------------ self-test ----
 self_test() {
   local status=0
@@ -503,6 +579,7 @@ J
 # ---------------------------------------------------------------- modes ----
 case "$MODE" in
   selftest) self_test; exit $? ;;
+  menubar)  menubar; exit 0 ;;
   json)
     ensure claude "$QUOTA_TTL" 1 >/dev/null; ensure codex "$QUOTA_TTL" 1 >/dev/null
     jq -n --slurpfile c "$CACHE_DIR/claude.json" --slurpfile x "$CACHE_DIR/codex.json" \

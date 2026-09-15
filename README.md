@@ -86,6 +86,7 @@ ai-usage                 # live dashboard
 ai-usage --days 7        # breakdown over 7 days instead of today
 ai-usage --once          # print one frame and exit (pipes, cron, status bars)
 ai-usage --json          # raw merged quota JSON
+ai-usage --menubar       # one SwiftBar/xbar frame
 ai-usage --self-test     # run the test suite
 ```
 
@@ -100,6 +101,23 @@ fetched quota is reused (default 60).
 
 Environment overrides: `AI_USAGE_CLAUDE_CREDS`, `AI_USAGE_CODEX_CREDS`,
 `AI_USAGE_CLAUDE_DIR`, `AI_USAGE_CACHE_DIR`, `AI_USAGE_AGG`, `NO_COLOR`.
+
+## Menu bar
+
+The same numbers in the macOS menu bar, via [SwiftBar](https://swiftbar.app):
+
+```sh
+brew install --cask swiftbar
+ln -s "$(brew --prefix)/share/ai-usage/ai-usage.30s.sh" ~/SwiftBar/ai-usage.30s.sh
+```
+
+The title shows whichever limit is closest to its ceiling — one number, coloured
+on the same ramp, so a glance tells you whether anything needs attention. The
+dropdown carries every limit with its countdown, today's top projects, and a
+"Open dashboard" item that launches the full view in a terminal.
+
+`ai-usage --menubar` prints one frame in SwiftBar/xbar format, so the plugin
+itself is a three-line wrapper; xbar works too.
 
 ## Colors
 
