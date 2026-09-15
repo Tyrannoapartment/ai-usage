@@ -412,6 +412,9 @@ MB_HEAD="color=#8b949e size=11"
 
 menubar() {
   ONCE=1   # short-lived process: fetch synchronously rather than in background
+  # SwiftBar renders plain text and colours a whole line at a time, so drop the
+  # ANSI ramp and let each row take one colour from its own percentage.
+  COLOR=0; WIDE=0
   local cs xs ls now rows="" top pct
   cs=$(ensure claude "$QUOTA_TTL" 0)
   xs=$(ensure codex  "$QUOTA_TTL" 0)
@@ -429,7 +432,7 @@ menubar() {
   top=$(printf '%s\n' "$rows" | awk -F'\t' '$3 > m { m = $3; line = $0 } END { print line }')
   pct=$(printf '%s' "$top" | cut -f3)
   if [ -n "$pct" ]; then
-    printf '\342\227\217 %.0f%% | color=%s\n' "$pct" "$(hex_for "$pct")"
+    printf '%s %.0f%% | color=%s font=Menlo\n' "$(bar "$pct" 5)" "$pct" "$(hex_for "$pct")"
   else
     printf '\342\227\217 -- | color=#8b949e\n'
   fi
@@ -445,7 +448,8 @@ menubar() {
     fi
     local trail=""
     [ "${reset:-0}" -gt 0 ] && trail=$(countdown $(( reset - now )))
-    printf '%-8s %5.1f%%  %-12s | %s color=%s\n' "$label" "$p" "$trail" "$MB_MONO" "$(hex_for "$p")"
+    printf '%-8s %s %5.1f%%  %-12s | %s color=%s\n' \
+      "$label" "$(bar "$p" 12)" "$p" "$trail" "$MB_MONO" "$(hex_for "$p")"
   done < <(printf '%s\n' "$rows")
 
   [ "$cs" = "missing" ] && printf 'CLAUDE: %s | color=#f0883e size=11\n' "$(claude_hint)"
@@ -459,7 +463,8 @@ menubar() {
     while IFS=$'\t' read -r _ name ttok tcost _ _; do
       [ -n "$name" ] || continue
       share=$(awk -v t="$ttok" -v a="${tok:-0}" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
-      printf '%-20.20s %5.1f%%  %7s | %s\n' "$name" "$share" "$(human_tok "$ttok")" "$MB_MONO"
+      printf '%-20.20s %s %5.1f%%  %7s | %s color=%s\n' \
+        "$name" "$(bar "$share" 8)" "$share" "$(human_tok "$ttok")" "$MB_MONO" "$(hex_for "$share")"
     done < <(local_rows PROJ | head -3)
   fi
 

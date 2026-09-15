@@ -3,7 +3,7 @@
 # SwiftBar / xbar plugin for ai-usage.
 #
 # <xbar.title>AI Usage</xbar.title>
-# <xbar.version>v0.2.0</xbar.version>
+# <xbar.version>v0.2.1</xbar.version>
 # <xbar.author>TyrannoApartment</xbar.author>
 # <xbar.desc>Claude and Codex quota in the menu bar.</xbar.desc>
 # <xbar.dependencies>ai-usage</xbar.dependencies>
