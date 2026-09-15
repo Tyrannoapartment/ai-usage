@@ -55,17 +55,23 @@ relative signal, not a bill.
 
 ## Install
 
-Requires macOS with `jq`, `curl`, `awk`, `python3` and `tput` — all of which
-ship in `/usr/bin` on a current macOS with the Xcode Command Line Tools. No
-Homebrew packages needed. Works on stock `/bin/bash` 3.2.
-
 ```sh
-git clone https://github.com/GiYeongUM/ai-usage.git
-cd ai-usage
-./install.sh          # symlinks bin/ai-usage into ~/.local/bin
+brew install GiYeongUM/tap/ai-usage
 ```
 
-Or just run it in place — `./bin/ai-usage` works from the checkout.
+Without Homebrew:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GiYeongUM/ai-usage/main/install.sh | sh
+```
+
+That clones into `~/.local/share/ai-usage` and links the command into
+`~/.local/bin`. Or clone it yourself and run `./bin/ai-usage` straight from the
+checkout — nothing is compiled.
+
+Requires macOS with `jq`, `curl`, `awk`, `python3` and `tput`. Homebrew pulls in
+`jq`; the rest ship in `/usr/bin` on a current macOS with the Xcode Command Line
+Tools. Runs on stock `/bin/bash` 3.2.
 
 ## Usage
 
