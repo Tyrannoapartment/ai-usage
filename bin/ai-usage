@@ -277,7 +277,13 @@ note_status() {   # source, http status
   printf '%s %s\n' "$2" "$(date +%s)" > "$f"
 }
 
-last_status() { cut -d' ' -f1 < "$CACHE_DIR/$ACCT_ID-$1.status" 2>/dev/null; }
+# `cmd < missing 2>/dev/null` still prints: the shell reports the failed
+# redirection before the later 2>/dev/null takes effect.
+last_status() {
+  local f="$CACHE_DIR/$ACCT_ID-$1.status"
+  [ -r "$f" ] || return 0
+  cut -d' ' -f1 < "$f" 2>/dev/null
+}
 status_age() { file_age "$CACHE_DIR/$ACCT_ID-$1.status"; }
 
 producer_claude() {
@@ -865,6 +871,32 @@ J
   check "a 429 is named, not hidden" \
     "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_hint | cut -d- -f1)" "rate limited by the usage API "
   rm -f "$tmp/rl-claude.status"
+  ACCT_ID=a0
+
+  echo "self-test: release hygiene"
+  local pkg_version app_version
+  pkg_version=$(jq -r .version "$AI_USAGE_ROOT/package.json" 2>/dev/null)
+  app_version=$(grep -o 'VERSION:-[0-9.]*' "$AI_USAGE_ROOT/menubar/build.sh" 2>/dev/null \
+                | head -1 | cut -d- -f2)
+  if [ -n "$pkg_version" ]; then
+    # The app bundle stamps its own version, which silently drifts from the
+    # package unless something checks.
+    check "app bundle version matches package.json" "$app_version" "$pkg_version"
+  fi
+
+  echo "self-test: quiet on a cold cache"
+  ACCT_ID=cold
+  check "no stderr when no status file exists yet" \
+    "$(last_status claude 2>&1 >/dev/null | wc -c | tr -d ' ')" "0"
+  ACCT_ID=a0
+
+  echo "self-test: unreadable responses"
+  ACCT_ID=shape
+  printf '{"limits":[{"kind":"something_new","percent":null}]}\n' > "$tmp/shape-claude.json"
+  check "a response we cannot parse yields no rows" "$(claude_rows | grep -c . )" "0"
+  check "and the panel says so" \
+    "$(quota_section T "" ok claude_rows claude_note "$tmp/shape-claude.json" claude_hint \
+       | grep -c 'API shape may')" "1"
   ACCT_ID=a0
 
   echo "self-test: display helpers"

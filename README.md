@@ -209,7 +209,7 @@ at it.
 ./test/run-tests.sh
 ```
 
-Thirty-one checks over fixtures, no network: quota parsing for both vendors,
+44 checks over fixtures, no network: quota parsing for both vendors,
 credential-source selection (Keychain vs. file, newest token wins), failure
 hints, token aggregation and de-duplication, pricing, and the display helpers.
 
