@@ -221,9 +221,15 @@ final class Controller: NSObject, NSMenuDelegate {
                     self.lastError = nil
                     self.render()
                 }
+            } catch is DecodingError {
+                // Almost always an app newer than the shell tool it drives.
+                DispatchQueue.main.async {
+                    self.lastError = "ai-usage is out of date - run: brew upgrade ai-usage"
+                    self.render()
+                }
             } catch {
                 DispatchQueue.main.async {
-                    self.lastError = "could not read usage: \(error.localizedDescription)"
+                    self.lastError = "could not run ai-usage: \(error.localizedDescription)"
                     self.render()
                 }
             }
@@ -270,6 +276,21 @@ final class Controller: NSObject, NSMenuDelegate {
 
     private static let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 
+    /// Width of one digit. Even in a monospaced font a Hangul glyph is not
+    /// exactly twice a Latin one, so padding with spaces can never line up
+    /// mixed scripts - the columns are tab stops measured in digit widths.
+    private static let advance: CGFloat =
+        "0".size(withAttributes: [.font: mono]).width
+
+    private static func columns(_ stops: [(CGFloat, NSTextAlignment)]) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.tabStops = stops.map {
+            NSTextTab(textAlignment: $0.1, location: $0.0 * advance)
+        }
+        style.defaultTabInterval = 8 * advance
+        return style
+    }
+
     /// A menu item with no action is drawn greyed out and ignores its colours,
     /// so informational rows carry a no-op selector to stay at full contrast.
     private func infoItem(_ title: NSAttributedString) -> NSMenuItem {
@@ -298,11 +319,14 @@ final class Controller: NSObject, NSMenuDelegate {
                 string: text,
                 attributes: [.font: Controller.mono, .foregroundColor: color]))
         }
-        add("  " + Format.pad(label, 7) + " ", .labelColor)
+        add("  " + label + "\t", .labelColor)
         add(String(repeating: "\u{2588}", count: filled), Palette.color(for: percent))
         add(String(repeating: "\u{2588}", count: width - filled), .quaternaryLabelColor)
-        add(String(format: "  %5.1f%%", percent), Palette.color(for: percent))
-        if !trailing.isEmpty { add("  " + Format.padLeft(trailing, 12), .secondaryLabelColor) }
+        add("\t" + String(format: "%.1f%%", percent), Palette.color(for: percent))
+        if !trailing.isEmpty { add("\t" + trailing, .secondaryLabelColor) }
+        line.addAttribute(.paragraphStyle,
+                          value: Controller.columns([(10, .left), (30, .right), (44, .right)]),
+                          range: NSRange(location: 0, length: line.length))
         return infoItem(line)
     }
 
@@ -311,10 +335,16 @@ final class Controller: NSObject, NSMenuDelegate {
     private func entryRows(_ entries: [Entry], of total: Double, limit: Int = 4) {
         for entry in entries.prefix(limit) {
             let share = total > 0 ? entry.tokens * 100 / total : 0
-            let text = "    " + Format.pad(entry.name, 22)
-                + Format.padLeft(String(format: "%.1f%%", share), 7) + "  "
-                + Format.padLeft(Format.tokens(entry.tokens), 8)
-            menu.addItem(row(text, color: .labelColor))
+            let text = "    " + entry.name
+                + "\t" + String(format: "%.1f%%", share)
+                + "\t" + Format.tokens(entry.tokens)
+            let line = NSMutableAttributedString(
+                string: text,
+                attributes: [.font: Controller.mono, .foregroundColor: NSColor.labelColor])
+            line.addAttribute(.paragraphStyle,
+                              value: Controller.columns([(34, .right), (44, .right)]),
+                              range: NSRange(location: 0, length: line.length))
+            menu.addItem(infoItem(line))
         }
     }
 
@@ -392,12 +422,13 @@ final class Controller: NSObject, NSMenuDelegate {
 
     @objc private func openDashboard() {
         guard let tool = toolPath else { return }
-        let script = "tell application \"Terminal\"\n"
-            + "activate\ndo script \"\(tool)\"\nend tell"
-        if let apple = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            apple.executeAndReturnError(&error)
-        }
+        // `open -a Terminal <script>` hands the file to Terminal to execute.
+        // NSAppleScript would need Automation consent, which an ad-hoc signed
+        // app loses on every rebuild - that is why this did nothing before.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Terminal", tool]
+        try? process.run()
     }
 
     // MARK: NSMenuDelegate

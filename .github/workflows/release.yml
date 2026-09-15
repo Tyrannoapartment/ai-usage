@@ -1,0 +1,177 @@
+name: release
+
+# Tag a version and everything else happens here: build, sign, notarize,
+# publish, and point Homebrew and npm at the result.
+#
+# Runs without any secrets too - it just produces an unsigned app and skips
+# whatever it has no credentials for, so the build stays verifiable.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and sign, but publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the test suite
+        run: /bin/bash ./bin/ai-usage --self-test
+
+      - name: See which credentials this run has
+        id: creds
+        env:
+          NOTARY: ${{ secrets.NOTARY_API_KEY }}
+          NPM: ${{ secrets.NPM_TOKEN }}
+          TAP: ${{ secrets.TAP_TOKEN }}
+        run: |
+          # The secrets context cannot be read from a step `if`, so each one is
+          # reduced to a boolean output here.
+          { [ -n "$NOTARY" ] && echo "notary=true" || echo "notary=false"
+            [ -n "$NPM" ]    && echo "npm=true"    || echo "npm=false"
+            [ -n "$TAP" ]    && echo "tap=true"    || echo "tap=false"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read the version
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(jq -r .version package.json)
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import the Developer ID certificate
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          if [ -z "$CERT_P12" ]; then
+            echo "no certificate secret - the app will be ad-hoc signed"
+            echo "identity=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A throwaway keychain, unlocked only for this job.
+          keychain=$RUNNER_TEMP/signing.keychain-db
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | grep "Developer ID Application" | head -1 \
+            | sed -E 's/.*"(.*)"/\1/')
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "signing as: $identity"
+
+      - name: Build AIUsage.app
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: ./menubar/build.sh
+
+      - name: Notarize and staple
+        if: steps.signing.outputs.identity != '' && steps.creds.outputs.notary == 'true'
+        env:
+          KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          API_KEY: ${{ secrets.NOTARY_API_KEY }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/key.p8"
+          ditto -c -k --keepParent dist/AIUsage.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/key.p8" --key-id "$KEY_ID" --issuer "$ISSUER_ID" \
+            --wait --timeout 30m
+          xcrun stapler staple dist/AIUsage.app
+          rm -f "$RUNNER_TEMP/key.p8"
+          echo "notarized and stapled"
+
+      - name: Package the app
+        run: |
+          ditto -c -k --keepParent dist/AIUsage.app "AIUsage-${{ steps.meta.outputs.version }}.zip"
+          shasum -a 256 "AIUsage-${{ steps.meta.outputs.version }}.zip"
+
+      - name: Verify what a user's Mac will check
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/AIUsage.app || true
+          spctl --assess --type execute --verbose dist/AIUsage.app || \
+            echo "not accepted by Gatekeeper (expected until the app is signed and notarized)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIUsage-app
+          path: AIUsage-${{ steps.meta.outputs.version }}.zip
+
+      - name: Attach the app to the release
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${{ steps.meta.outputs.tag }}
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --generate-notes
+          gh release upload "$tag" "AIUsage-${{ steps.meta.outputs.version }}.zip" --clobber
+
+      - name: Publish to npm
+        if: steps.meta.outputs.publish == 'true' && steps.creds.outputs.npm == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          npm publish --access public || echo "already published at this version"
+          rm -f ~/.npmrc
+
+      - name: Point the Homebrew tap at this release
+        if: steps.meta.outputs.publish == 'true' && steps.creds.outputs.tap == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          version=${{ steps.meta.outputs.version }}
+          tarball="https://github.com/${{ github.repository }}/archive/refs/tags/v${version}.tar.gz"
+          src_sha=$(curl -sSL "$tarball" | shasum -a 256 | cut -d' ' -f1)
+          app_sha=$(shasum -a 256 "AIUsage-${version}.zip" | cut -d' ' -f1)
+
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/homebrew-tap.git" tap
+          cd tap
+          sed -i '' -E \
+            -e "s|/archive/refs/tags/v[0-9.]+\.tar\.gz|/archive/refs/tags/v${version}.tar.gz|" \
+            -e "s|sha256 \"[a-f0-9]+\"|sha256 \"${src_sha}\"|" \
+            Formula/ai-usage.rb
+          if [ -f Casks/ai-usage-app.rb ]; then
+            sed -i '' -E \
+              -e "s|version \"[0-9.]+\"|version \"${version}\"|" \
+              -e "s|sha256 \"[a-f0-9]+\"|sha256 \"${app_sha}\"|" \
+              Casks/ai-usage-app.rb
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git commit -aqm "ai-usage ${version}"; then
+            git push --quiet
+            echo "tap updated"
+          else
+            echo "tap already points at ${version}"
+          fi

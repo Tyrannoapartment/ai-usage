@@ -40,10 +40,16 @@ swiftc -O -swift-version 5 \
   -o "$APP/Contents/MacOS/AIUsage" \
   "$ROOT/menubar/AIUsage.swift"
 
-# Ad-hoc signature: enough for the machine that built it, and it keeps macOS
-# from re-prompting on every launch. Distribution to other machines would need
-# a Developer ID and notarization, which building from source avoids.
-codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+# SIGN_IDENTITY is set by CI, which holds the Developer ID certificate. Local
+# builds fall back to an ad-hoc signature: enough for the machine that built
+# the app, and it keeps macOS from re-prompting on every launch.
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp \
+    --sign "$SIGN_IDENTITY" "$APP"
+  echo "signed with: $SIGN_IDENTITY"
+else
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+fi
 
 echo "built $APP"
 
