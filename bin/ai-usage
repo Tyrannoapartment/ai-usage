@@ -30,6 +30,7 @@ set -uo pipefail
 CLAUDE_CREDS=${AI_USAGE_CLAUDE_CREDS:-$HOME/.claude/.credentials.json}
 CODEX_CREDS=${AI_USAGE_CODEX_CREDS:-$HOME/.codex/auth.json}
 CLAUDE_DIR=${AI_USAGE_CLAUDE_DIR:-$HOME/.claude/projects}
+CODEX_DIR=${AI_USAGE_CODEX_DIR:-$HOME/.codex/sessions}
 CACHE_DIR=${AI_USAGE_CACHE_DIR:-$HOME/.cache/ai-usage}
 # Locate lib/aggregate.py relative to this script, following symlinks so the
 # command can be linked onto PATH from anywhere.
@@ -211,7 +212,7 @@ producer_codex() {
     | jq -e . 2>/dev/null
 }
 
-producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" 2>/dev/null; }
+producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" "$CODEX_DIR" 2>/dev/null; }
 
 cache_file() { case "$1" in local) echo "$CACHE_DIR/local-$DAYS.tsv" ;; *) echo "$CACHE_DIR/$1.json" ;; esac; }
 
@@ -352,13 +353,18 @@ breakdown_section() {   # title, kind, total_tokens
   local title=$1 kind=$2 total=$3 name tok cost msgs pad share
   printf ' %s%s%s\n' "$C_BOLD" "$title" "$C_RESET"
   local got=0
+  # No gauge and no heat colour here: a share of the window's tokens has no
+  # ceiling to fill, so the visual language used for quota would mislead.
   while IFS=$'\t' read -r _ name tok cost msgs pad; do
     [ -n "$name" ] || continue
     got=1
     share=$(awk -v t="$tok" -v a="$total" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
-    printf '  %s %s %s%5.1f%%%s  %7s  %s$%.2f%s\n' \
-      "${pad:-$name}" "$(bar "$share" 10)" "$(pct_color "$share")" "$share" "$C_RESET" \
-      "$(human_tok "$tok")" "$C_DIM" "$cost" "$C_RESET"
+    if awk -v c="$cost" 'BEGIN { exit !(c > 0) }'; then
+      printf '  %s %5.1f%%  %7s  %s$%.2f%s\n' \
+        "${pad:-$name}" "$share" "$(human_tok "$tok")" "$C_DIM" "$cost" "$C_RESET"
+    else
+      printf '  %s %5.1f%%  %7s\n' "${pad:-$name}" "$share" "$(human_tok "$tok")"
+    fi
   done < <(local_rows "$kind")
   [ "$got" = "1" ] || printf '  %sno activity in this window%s\n' "$C_DIM" "$C_RESET"
 }
@@ -389,6 +395,16 @@ render() {
     printf '\n'
     printf ' %sWHAT%s %s(%s - by model)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
     breakdown_section "" MODEL "$tok" | tail -n +2
+
+    local cxtok cxmsgs
+    IFS=$'\t' read -r _ _ cxtok _ cxmsgs _ < <(local_rows CODEX_TOTAL)
+    if [ "${cxtok:-0}" -gt 0 ]; then
+      printf '\n'
+      printf ' %sCODEX%s %s(%s - %s tok, %s msgs; no public rate, tokens only)%s\n' \
+        "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$cxtok")" "${cxmsgs:-0}" "$C_RESET"
+      breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2
+      breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2
+    fi
   fi
 
   [ "$ONCE" = "0" ] && printf '\n %s[q] quit  [r] refetch  [d] %s  -  api %ss, local %ss%s\n' \
@@ -401,11 +417,10 @@ render() {
 # any of the parsing, pricing or aggregation done here.
 report() {
   ONCE=1
-  local cs xs ls limits projects models total range
-  cs=$(ensure claude "$QUOTA_TTL" "${1:-0}")
-  xs=$(ensure codex  "$QUOTA_TTL" "${1:-0}")
-  ls=$(ensure local  "$LOCAL_TTL" "${1:-0}")
-  [ "$DAYS" = "1" ] && range=today || range="${DAYS}d"
+  local cs xs limits
+
+  cs=$(ensure claude "$QUOTA_TTL" 0)
+  xs=$(ensure codex  "$QUOTA_TTL" 0)
 
   limits=$({
     [ "$cs" != "missing" ] && claude_rows | awk '{ print "claude\t" $0 }'
@@ -414,24 +429,41 @@ report() {
       | {source: .[0], label: .[1], percent: (.[2] | tonumber),
          resets_at: (.[3] // "0" | tonumber)})')
 
-  rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
-      | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
-         messages: (.[4] | tonumber)})'; }
-  projects=$(local_rows PROJ  | rows_json)
-  models=$(local_rows MODEL | rows_json)
-  total=$(local_rows TOTAL | jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
-      | if length == 0 then {tokens: 0, cost: 0, messages: 0}
-        else (.[0] | {tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
-                      messages: (.[4] | tonumber)}) end')
+  # One snapshot carries every range the front ends show, so they never have to
+  # re-run the tool to switch between them.
+  breakdown_for() {
+    DAYS=$1
+    ensure local "$LOCAL_TTL" 0 >/dev/null
+    local projects models total
+    rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+        | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+           messages: (.[4] | tonumber)})'; }
+    total_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t"))
+        | if length == 0 then {tokens: 0, cost: 0, messages: 0}
+          else (.[0] | {tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
+                        messages: (.[4] | tonumber)}) end'; }
+    jq -n \
+      --argjson projects "$(local_rows PROJ | rows_json)" \
+      --argjson models "$(local_rows MODEL | rows_json)" \
+      --argjson total "$(local_rows TOTAL | total_json)" \
+      --argjson cx_projects "$(local_rows CODEX_PROJ | rows_json)" \
+      --argjson cx_models "$(local_rows CODEX_MODEL | rows_json)" \
+      --argjson cx_total "$(local_rows CODEX_TOTAL | total_json)" \
+      '{claude: {total: $total, projects: $projects, models: $models},
+        codex:  {total: $cx_total, projects: $cx_projects, models: $cx_models}}'
+  }
+
+  local today week
+  today=$(breakdown_for 1)
+  week=$(breakdown_for 7)
 
   jq -n \
-    --argjson limits "$limits" --argjson projects "$projects" \
-    --argjson models "$models" --argjson total "$total" \
-    --arg range "$range" --arg claude_err "$([ "$cs" = missing ] && claude_hint)" \
+    --argjson limits "$limits" --argjson today "$today" --argjson week "$week" \
+    --arg claude_err "$([ "$cs" = missing ] && claude_hint)" \
     --arg codex_err "$([ "$xs" = missing ] && codex_hint)" \
     --argjson now "$(date +%s)" \
     '{generated_at: $now, limits: $limits,
-      breakdown: {range: $range, total: $total, projects: $projects, models: $models},
+      breakdowns: {today: $today, week: $week},
       errors: {claude: (if $claude_err == "" then null else $claude_err end),
                codex:  (if $codex_err  == "" then null else $codex_err  end)}}'
 }
@@ -607,6 +639,25 @@ J
   check "stale file + locked keychain" \
     "$(CLAUDE_CREDS=$tmp/creds-old.json claude_hint)" \
     "Keychain is locked - run this on the Mac itself (ssh cannot read it)"
+
+  echo "self-test: aggregation wiring"
+  mkdir -p "$tmp/cx/2026/09/15"
+  {
+    printf '{"timestamp":"%s","type":"session_meta","payload":{"cwd":"/work/gamma"}}\n' "$today"
+    printf '{"timestamp":"%s","type":"turn_context","payload":{"cwd":"/work/gamma","model":"gpt-test"}}\n' "$today"
+    printf '{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":5000}}}}\n' "$today"
+    printf '{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":2500}}}}\n' "$today"
+  } > "$tmp/cx/2026/09/15/rollout-2026-09-15T00-00-00-test.jsonl"
+  local wired
+  wired=$(CLAUDE_DIR="$tmp/cc" CODEX_DIR="$tmp/cx" DAYS=1 producer_local)
+  check "producer runs with every directory set" \
+    "$(printf '%s' "$wired" | awk -F"\t" '$1=="CODEX_TOTAL"{print $3}')" "7500"
+  check "codex project attributed from cwd" \
+    "$(printf '%s' "$wired" | awk -F"\t" '$1=="CODEX_PROJ"{print $2; exit}')" "gamma"
+  check "codex model attributed from turn_context" \
+    "$(printf '%s' "$wired" | awk -F"\t" '$1=="CODEX_MODEL"{print $2; exit}')" "gpt-test"
+  check "claude rows still emitted alongside" \
+    "$(printf '%s' "$wired" | awk -F"\t" '$1=="TOTAL"{print $3}')" "15000"
 
   echo "self-test: display helpers"
   check "human_tok 1500000"  "$(human_tok 1500000)"  "1.5M"

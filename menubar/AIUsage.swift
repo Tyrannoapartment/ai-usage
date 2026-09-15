@@ -34,10 +34,20 @@ struct Total: Decodable {
 }
 
 struct Breakdown: Decodable {
-    let range: String
     let total: Total
     let projects: [Entry]
     let models: [Entry]
+}
+
+/// One reporting window, split by the tool that produced the tokens.
+struct Window: Decodable {
+    let claude: Breakdown
+    let codex: Breakdown
+}
+
+struct Windows: Decodable {
+    let today: Window
+    let week: Window
 }
 
 struct Errors: Decodable {
@@ -48,12 +58,12 @@ struct Errors: Decodable {
 struct Report: Decodable {
     let generatedAt: Double
     let limits: [Limit]
-    let breakdown: Breakdown
+    let breakdowns: Windows
     let errors: Errors
 
     enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
-        case limits, breakdown, errors
+        case limits, breakdowns, errors
     }
 }
 
@@ -88,6 +98,36 @@ enum Format {
         if n >= 1_000_000 { return String(format: "%.1fM", n / 1_000_000) }
         if n >= 1_000 { return String(format: "%.0fK", n / 1_000) }
         return String(format: "%.0f", n)
+    }
+
+    /// Pad to a column width, counting East Asian wide characters as two so
+    /// Korean project names do not break the alignment.
+    static func visualWidth<S: StringProtocol>(_ s: S) -> Int {
+        s.reduce(0) { total, ch in
+            guard let scalar = ch.unicodeScalars.first else { return total }
+            switch scalar.value {
+            case 0x1100...0x115F, 0x2E80...0xA4CF, 0xAC00...0xD7A3,
+                 0xF900...0xFAFF, 0xFE30...0xFE6F, 0xFF00...0xFF60,
+                 0xFFE0...0xFFE6, 0x20000...0x3FFFD:
+                return total + 2
+            default:
+                return total + 1
+            }
+        }
+    }
+
+    static func pad(_ text: String, _ columns: Int) -> String {
+        var out = Substring(text)
+        while visualWidth(out) > columns { out = out.dropLast() }
+        return String(out) + String(repeating: " ", count: max(0, columns - visualWidth(out)))
+    }
+
+    /// Right-aligned counterpart to `pad`, for numbers and countdowns.
+    static func padLeft(_ text: String, _ columns: Int) -> String {
+        let padded = pad(text, columns)
+        let trimmed = padded.hasSuffix(" ")
+            ? String(padded.reversed().drop { $0 == " " }.reversed()) : padded
+        return String(repeating: " ", count: max(0, columns - visualWidth(trimmed))) + trimmed
     }
 
     /// A block-character gauge, for the monospaced menu rows.
@@ -128,7 +168,6 @@ final class Controller: NSObject, NSMenuDelegate {
     private var refreshTimer: Timer?
     private var tickTimer: Timer?
     private var menuIsOpen = false
-    private var range = "today"
 
     /// The tool is looked up on PATH, then in the usual install locations, so
     /// the app works whether it came from Homebrew, npm or a checkout.
@@ -168,7 +207,7 @@ final class Controller: NSObject, NSMenuDelegate {
         DispatchQueue.global(qos: .utility).async {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: tool)
-            process.arguments = ["--report", "--days", self.range == "today" ? "1" : "7"]
+            process.arguments = ["--report"]
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
@@ -229,16 +268,74 @@ final class Controller: NSObject, NSMenuDelegate {
         return item
     }
 
-    private func row(_ text: String, color: NSColor) -> NSMenuItem {
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        item.attributedTitle = NSAttributedString(
-            string: text,
-            attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                .foregroundColor: color,
-            ])
-        item.isEnabled = false
+    private static let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
+    /// A menu item with no action is drawn greyed out and ignores its colours,
+    /// so informational rows carry a no-op selector to stay at full contrast.
+    private func infoItem(_ title: NSAttributedString) -> NSMenuItem {
+        let item = NSMenuItem(title: title.string, action: #selector(noop), keyEquivalent: "")
+        item.target = self
+        item.attributedTitle = title
         return item
+    }
+
+    @objc private func noop() {}
+
+    private func row(_ text: String, color: NSColor) -> NSMenuItem {
+        infoItem(NSAttributedString(
+            string: text,
+            attributes: [.font: Controller.mono, .foregroundColor: color]))
+    }
+
+    /// A solid two-tone gauge: the same block for filled and empty, told apart
+    /// by colour rather than by texture.
+    private func gaugeRow(label: String, percent: Double, trailing: String) -> NSMenuItem {
+        let width = 12
+        let filled = Int((max(0, min(100, percent)) * Double(width) / 100).rounded())
+        let line = NSMutableAttributedString()
+        func add(_ text: String, _ color: NSColor) {
+            line.append(NSAttributedString(
+                string: text,
+                attributes: [.font: Controller.mono, .foregroundColor: color]))
+        }
+        add("  " + Format.pad(label, 7) + " ", .labelColor)
+        add(String(repeating: "\u{2588}", count: filled), Palette.color(for: percent))
+        add(String(repeating: "\u{2588}", count: width - filled), .quaternaryLabelColor)
+        add(String(format: "  %5.1f%%", percent), Palette.color(for: percent))
+        if !trailing.isEmpty { add("  " + Format.padLeft(trailing, 12), .secondaryLabelColor) }
+        return infoItem(line)
+    }
+
+    /// Sessions are ranked, not gauged: a share of a window's tokens has no
+    /// ceiling, so no bar and no heat colour here - just right-aligned numbers.
+    private func entryRows(_ entries: [Entry], of total: Double, limit: Int = 4) {
+        for entry in entries.prefix(limit) {
+            let share = total > 0 ? entry.tokens * 100 / total : 0
+            let text = "    " + Format.pad(entry.name, 22)
+                + Format.padLeft(String(format: "%.1f%%", share), 7) + "  "
+                + Format.padLeft(Format.tokens(entry.tokens), 8)
+            menu.addItem(row(text, color: .labelColor))
+        }
+    }
+
+    private func renderWindow(_ title: String, _ window: Window) {
+        let claude = window.claude, codex = window.codex
+        var summary = title + "   " + Format.tokens(claude.total.tokens + codex.total.tokens)
+            + " tok"
+        if claude.total.cost > 0 {
+            summary += String(format: "   ~$%.2f", claude.total.cost)
+        }
+        menu.addItem(header(summary))
+
+        // Everything is laid out at once - nothing hides behind a toggle.
+        for (name, data) in [("claude", claude), ("codex", codex)] {
+            guard data.total.tokens > 0 else { continue }
+            menu.addItem(row("  \(name) - sessions", color: .secondaryLabelColor))
+            entryRows(data.projects, of: data.total.tokens)
+            menu.addItem(row("  \(name) - models", color: .secondaryLabelColor))
+            entryRows(data.models, of: data.total.tokens)
+        }
+        menu.addItem(.separator())
     }
 
     private func rebuildMenu() {
@@ -262,35 +359,16 @@ final class Controller: NSObject, NSMenuDelegate {
                 for limit in limits {
                     let left = limit.resetsAt > 0
                         ? Format.countdown(limit.resetsAt - now) : ""
-                    let text = String(format: "  %-8@ %@ %5.1f%%  %@",
-                                      limit.label as NSString,
-                                      Format.bar(limit.percent, width: 12),
-                                      limit.percent, left)
-                    menu.addItem(row(text, color: Palette.color(for: limit.percent)))
+                    menu.addItem(gaugeRow(label: limit.label,
+                                          percent: limit.percent,
+                                          trailing: left))
                 }
                 menu.addItem(.separator())
             }
 
-            let total = report.breakdown.total
-            menu.addItem(header("\(report.breakdown.range.uppercased())  "
-                + "\(Format.tokens(total.tokens)) tok  ~$\(String(format: "%.2f", total.cost))  "
-                + "\(total.messages) msgs"))
-            // Sessions are ranked, not gauged: a share of today's tokens has no
-            // ceiling to fill, so a bar and a heat colour would both mislead.
-            for entry in report.breakdown.projects.prefix(5) {
-                let share = total.tokens > 0 ? entry.tokens * 100 / total.tokens : 0
-                let text = String(format: "  %-24@ %5.1f%%  %@",
-                                  String(entry.name.prefix(24)) as NSString, share,
-                                  Format.tokens(entry.tokens))
-                menu.addItem(row(text, color: .labelColor))
-            }
-            menu.addItem(.separator())
+            renderWindow("TODAY", report.breakdowns.today)
+            renderWindow("LAST 7 DAYS", report.breakdowns.week)
         }
-
-        let toggle = NSMenuItem(title: range == "today" ? "Show last 7 days" : "Show today",
-                                action: #selector(toggleRange), keyEquivalent: "d")
-        toggle.target = self
-        menu.addItem(toggle)
 
         let dashboard = NSMenuItem(title: "Open dashboard", action: #selector(openDashboard),
                                    keyEquivalent: "o")
@@ -309,11 +387,6 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     // MARK: Actions
-
-    @objc private func toggleRange() {
-        range = range == "today" ? "7d" : "today"
-        refresh()
-    }
 
     @objc private func reloadNow() { refresh() }
 
