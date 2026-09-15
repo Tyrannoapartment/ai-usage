@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/tyranno-ai-usage.png" alt="Tyranno holding a usage gauge" width="240">
+</p>
+
 # ai-usage
 
 A terminal dashboard for how much of your Claude and Codex quota you have left —
