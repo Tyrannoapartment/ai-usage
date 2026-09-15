@@ -56,13 +56,19 @@ relative signal, not a bill.
 ## Install
 
 ```sh
-brew install GiYeongUM/tap/ai-usage
+brew install Tyrannoapartment/tap/ai-usage
 ```
 
-Without Homebrew:
+Without Homebrew — run it once, no install:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/GiYeongUM/ai-usage/main/install.sh | sh
+npx @tyrannoapartment/ai-usage
+```
+
+Or install from source:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Tyrannoapartment/ai-usage/main/install.sh | sh
 ```
 
 That clones into `~/.local/share/ai-usage` and links the command into

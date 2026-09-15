@@ -7,7 +7,7 @@
 # Override the destinations with BIN_DIR and SRC_DIR.
 set -e
 
-REPO=https://github.com/GiYeongUM/ai-usage.git
+REPO=https://github.com/Tyrannoapartment/ai-usage.git
 BIN=${BIN_DIR:-$HOME/.local/bin}
 SRC=${SRC_DIR:-$HOME/.local/share/ai-usage}
 
