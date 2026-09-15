@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# ai-usage - live quota monitor for Claude Code and Codex
+#
+# Quota percentages come from the same endpoints the official clients use,
+# authenticated with the OAuth tokens those clients already stored on this
+# machine. Each token is sent only to its own vendor:
+#
+#   Claude  macOS login Keychain, or ~/.claude/.credentials.json
+#             -> api.anthropic.com/api/oauth/usage
+#   Codex   ~/.codex/auth.json
+#             -> chatgpt.com/backend-api/wham/usage
+#
+# The breakdown by project and model is read from local Claude transcripts.
+# Its token counts are exact; the dollar column is an estimate (tokens priced
+# at public API rates) because subscription plans report no dollar figures.
+#
+#   ai-usage              live view; clock and countdowns tick every second
+#   ai-usage --days 7     breakdown over 7 days instead of today
+#   ai-usage --once       print one frame and exit
+#   ai-usage --json       raw merged quota JSON
+#   ai-usage --self-test  verify parsing, colors and aggregation
+#
+# Options: -i SECONDS screen redraw, --ttl SECONDS quota reuse window
+# Keys:    q quit   r refetch now   d toggle today/7d
+
+set -uo pipefail
+
+CLAUDE_CREDS=${AI_USAGE_CLAUDE_CREDS:-$HOME/.claude/.credentials.json}
+CODEX_CREDS=${AI_USAGE_CODEX_CREDS:-$HOME/.codex/auth.json}
+CLAUDE_DIR=${AI_USAGE_CLAUDE_DIR:-$HOME/.claude/projects}
+CACHE_DIR=${AI_USAGE_CACHE_DIR:-$HOME/.cache/ai-usage}
+# Locate lib/aggregate.py relative to this script, following symlinks so the
+# command can be linked onto PATH from anywhere.
+self_path=$0
+while [ -L "$self_path" ]; do
+  link=$(readlink "$self_path")
+  case "$link" in
+    /*) self_path=$link ;;
+    *)  self_path=$(dirname "$self_path")/$link ;;
+  esac
+done
+AI_USAGE_ROOT=$(cd "$(dirname "$self_path")/.." && pwd)
+AGG=${AI_USAGE_AGG:-$AI_USAGE_ROOT/lib/aggregate.py}
+
+CLAUDE_URL=https://api.anthropic.com/api/oauth/usage
+CODEX_URL=https://chatgpt.com/backend-api/wham/usage
+
+INTERVAL=1      # screen redraw - keeps the countdowns live
+QUOTA_TTL=60    # how often the quota APIs are re-queried
+LOCAL_TTL=90    # how often local transcripts are re-aggregated
+DAYS=1
+ONCE=0
+MODE=live
+
+usage() { sed -n '2,/^[^#]/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--interval) INTERVAL=$2; shift 2 ;;
+    --ttl)         QUOTA_TTL=$2; shift 2 ;;
+    --days)        DAYS=$2; shift 2 ;;
+    --once)        ONCE=1; shift ;;
+    --json)        MODE=json; shift ;;
+    --self-test)   MODE=selftest; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+for b in jq curl awk python3; do
+  command -v "$b" >/dev/null 2>&1 || { echo "ai-usage: '$b' is required" >&2; exit 1; }
+done
+mkdir -p "$CACHE_DIR"
+
+# ---------------------------------------------------------------- colors ----
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  COLOR=1
+  NCOLORS=$(tput colors 2>/dev/null || echo 8)
+  C_RESET=$(printf '\033[0m'); C_DIM=$(printf '\033[2m'); C_BOLD=$(printf '\033[1m')
+  C_CYAN=$(printf '\033[36m'); C_MAGENTA=$(printf '\033[35m'); C_YELLOW=$(printf '\033[33m')
+  C_RED=$(printf '\033[31m')
+else
+  COLOR=0; NCOLORS=0
+  C_RESET=; C_DIM=; C_BOLD=; C_CYAN=; C_MAGENTA=; C_YELLOW=; C_RED=
+fi
+[ "$NCOLORS" -ge 256 ] 2>/dev/null && WIDE=1 || WIDE=0
+
+# A seven-stop ramp: the further along a percentage sits, the hotter it reads.
+# Used both for the number and, position by position, for the bar itself.
+ramp() { awk -v p="$1" -v wide="$2" 'BEGIN {
+  if (wide) {
+    if (p < 20) c = 46; else if (p < 35) c = 82; else if (p < 50) c = 154
+    else if (p < 65) c = 226; else if (p < 78) c = 214
+    else if (p < 90) c = 208; else c = 196
+    printf "\033[38;5;%dm", c
+  } else {
+    if (p < 50) printf "\033[32m"; else if (p < 80) printf "\033[33m"
+    else printf "\033[31m"
+  } }'; }
+
+pct_color() { [ "$COLOR" = "1" ] && ramp "$1" "$WIDE" || true; }
+
+bar() {   # percent, width - filled cells are coloured by their own position
+  awk -v p="$1" -v w="$2" -v color="$COLOR" -v wide="$WIDE" 'BEGIN {
+    if (p < 0) p = 0; if (p > 100) p = 100
+    filled = int(p * w / 100 + 0.5)
+    for (i = 0; i < w; i++) {
+      if (i < filled) {
+        if (color) {
+          q = (i + 0.5) * 100 / w
+          if (wide) {
+            if (q < 20) c = 46; else if (q < 35) c = 82; else if (q < 50) c = 154
+            else if (q < 65) c = 226; else if (q < 78) c = 214
+            else if (q < 90) c = 208; else c = 196
+            printf "\033[38;5;%dm", c
+          } else {
+            if (q < 50) printf "\033[32m"; else if (q < 80) printf "\033[33m"
+            else printf "\033[31m"
+          }
+        }
+        printf "\342\226\210"
+      } else {
+        if (color) printf (wide ? "\033[38;5;236m" : "\033[2m")
+        printf "\342\226\221"
+      }
+    }
+    if (color) printf "\033[0m"
+  }'; }
+
+human_tok() { awk -v n="$1" 'BEGIN {
+  if (n >= 1000000000) printf "%.2fB", n/1000000000
+  else if (n >= 1000000) printf "%.1fM", n/1000000
+  else if (n >= 1000) printf "%.0fK", n/1000
+  else printf "%d", n }'; }
+
+# Ticks every second, so the countdown visibly moves between API refreshes.
+countdown() { awk -v s="$1" 'BEGIN {
+  if (s < 0) s = 0
+  d = int(s/86400); s -= d*86400
+  h = int(s/3600);  s -= h*3600
+  m = int(s/60);    s -= m*60
+  if (d > 0)      printf "%dd %02d:%02d:%02d", d, h, m, s
+  else if (h > 0) printf "%d:%02d:%02d", h, m, s
+  else            printf "%d:%02d", m, s }'; }
+
+human_age() { awk -v s="$1" 'BEGIN {
+  if (s < 60) printf "%ds", s
+  else if (s < 3600) printf "%dm", s/60
+  else printf "%.1fh", s/3600 }'; }
+
+win_label() { awk -v s="$1" 'BEGIN {
+  if (s == 18000) print "5h"; else if (s == 86400) print "daily"
+  else if (s == 604800) print "weekly"
+  else if (s >= 86400) printf "%dd", s/86400; else printf "%dh", s/3600 }'; }
+
+file_age() { local m
+  m=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || { echo 999999999; return; }
+  echo $(( $(date +%s) - m )); }
+
+# ------------------------------------------------------ data acquisition ----
+# Claude Code keeps its OAuth credentials in the macOS login Keychain and
+# leaves ~/.claude/.credentials.json behind as a copy that can go stale. Read
+# both and use whichever token expires later.
+keychain_cred() {
+  command -v security >/dev/null 2>&1 || return 1
+  security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+    || security find-generic-password -s "Claude Code-credentials" -w \
+         "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null
+}
+
+keychain_item_present() {
+  command -v security >/dev/null 2>&1 || return 1
+  security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1 \
+    || security find-generic-password -s "Claude Code-credentials" \
+         "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1
+}
+
+cred_expiry() { printf '%s' "${1:-}" | jq -r '.claudeAiOauth.expiresAt // 0' 2>/dev/null || echo 0; }
+
+claude_cred() {
+  local k f ke fe
+  k=$(keychain_cred); [ -f "$CLAUDE_CREDS" ] && f=$(cat "$CLAUDE_CREDS" 2>/dev/null)
+  ke=$(cred_expiry "${k:-}"); fe=$(cred_expiry "${f:-}")
+  ke=${ke:-0}; fe=${fe:-0}
+  if [ "$ke" != "0" ] && awk -v a="$ke" -v b="$fe" 'BEGIN { exit !(a >= b) }'; then printf '%s' "$k"
+  elif [ "$fe" != "0" ]; then printf '%s' "$f"
+  else printf '%s' "${k:-${f:-}}"; fi
+}
+
+producer_claude() {
+  local tok; tok=$(claude_cred | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+  [ -n "$tok" ] || return 1
+  curl -sS --max-time 10 --fail "$CLAUDE_URL" \
+    -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
+    -H "User-Agent: ai-usage.sh (local quota monitor)" -H "Accept: application/json" \
+    | jq -e . 2>/dev/null
+}
+
+producer_codex() {
+  local tok acct
+  tok=$(jq -r '.tokens.access_token // empty' "$CODEX_CREDS" 2>/dev/null)
+  acct=$(jq -r '.tokens.account_id // empty' "$CODEX_CREDS" 2>/dev/null)
+  [ -n "$tok" ] || return 1
+  curl -sS --max-time 10 --fail "$CODEX_URL" \
+    -H "Authorization: Bearer $tok" ${acct:+-H "chatgpt-account-id: $acct"} \
+    -H "originator: codex_cli_rs" -H "Accept: application/json" \
+    | jq -e . 2>/dev/null
+}
+
+producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" 2>/dev/null; }
+
+cache_file() { case "$1" in local) echo "$CACHE_DIR/local-$DAYS.tsv" ;; *) echo "$CACHE_DIR/$1.json" ;; esac; }
+
+fetch_sync() {   # name -> 0 if the cache now holds something usable
+  local name=$1 out tmp
+  out=$(cache_file "$name"); tmp="$out.tmp.$$"
+  if "producer_$name" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv "$tmp" "$out"; return 0
+  fi
+  rm -f "$tmp"; [ -s "$out" ]
+}
+
+# Refresh in the background so the one-second redraw never stalls on a network
+# call or a transcript scan.
+fetch_async() {
+  local name=$1 lock
+  lock="$CACHE_DIR/$name.lock"
+  mkdir "$lock" 2>/dev/null || return 0
+  ( fetch_sync "$name"; rmdir "$lock" ) >/dev/null 2>&1 &
+}
+
+ensure() {   # name, ttl, force -> echoes ok | stale | missing
+  local name=$1 ttl=$2 force=$3 out age
+  out=$(cache_file "$name"); age=$(file_age "$out")
+  if [ ! -s "$out" ]; then
+    if [ "$ONCE" = "1" ] || [ "$MODE" = "json" ]; then
+      fetch_sync "$name" && { echo ok; return; }
+      echo missing; return
+    fi
+    fetch_async "$name"; echo missing; return
+  fi
+  if [ "$force" = "1" ] || [ "$age" -ge "$ttl" ]; then
+    if [ "$ONCE" = "1" ]; then fetch_sync "$name" >/dev/null; else fetch_async "$name"; fi
+    age=$(file_age "$out")
+  fi
+  local limit=$(( ttl * 5 )); [ "$limit" -lt 300 ] && limit=300
+  [ "$age" -ge "$limit" ] && echo stale || echo ok
+}
+
+# ----------------------------------------------------------------- parse ----
+CLAUDE_ROWS_JQ='
+def epoch: if . == null then 0
+           else (sub("\\.[0-9]+";"") | sub("\\+00:00";"Z") | fromdateiso8601) end;
+(.limits // []) | map(select(.percent != null)) | .[]
+| [ (if .kind == "session" then "5h"
+     elif .kind == "weekly_all" then "weekly"
+     elif .scope.model.display_name != null then (.scope.model.display_name | ascii_downcase)
+     else .kind end),
+    .percent, (.resets_at | epoch) ] | @tsv'
+
+CODEX_ROWS_JQ='
+(.rate_limit // {}) | [ .primary_window, .secondary_window ] | map(select(. != null)) | .[]
+| [ (.limit_window_seconds // 0 | tostring), .used_percent, (.reset_at // 0) ] | @tsv'
+
+claude_rows() { jq -r "$CLAUDE_ROWS_JQ" "$CACHE_DIR/claude.json" 2>/dev/null; }
+codex_rows() { jq -r "$CODEX_ROWS_JQ" "$CACHE_DIR/codex.json" 2>/dev/null \
+  | while IFS=$'\t' read -r w p r; do printf '%s\t%s\t%s\n' "$(win_label "$w")" "$p" "$r"; done; }
+
+claude_note() { jq -r '
+  [ (if .spend.enabled == true then "extra usage on" else empty end),
+    (if .spend.used.amount_minor then
+       "extra spend $\(.spend.used.amount_minor / pow(10; .spend.used.exponent))" else empty end),
+    ((.limits // []) | map(select(.severity != null and .severity != "normal") | .severity)
+      | if length > 0 then "severity " + join(",") else empty end) ]
+  | join("  ")' "$CACHE_DIR/claude.json" 2>/dev/null; }
+
+codex_note() { jq -r '
+  [ "plan \(.plan_type // "?")",
+    (if .credits.unlimited == true then "credits unlimited"
+     elif .credits.balance != null then "credits \(.credits.balance)" else empty end),
+    (if .rate_limit_reset_credits.available_count then
+       "reset credits \(.rate_limit_reset_credits.available_count)" else empty end),
+    (if .spend_control.reached == true then "SPEND LIMIT REACHED" else empty end) ]
+  | join("  ")' "$CACHE_DIR/codex.json" 2>/dev/null; }
+
+local_rows() { grep "^$1"$'\t' "$(cache_file local)" 2>/dev/null; }
+
+claude_hint() {
+  local cred exp now
+  cred=$(claude_cred)
+  if [ -z "$cred" ]; then
+    keychain_item_present \
+      && echo "Keychain is locked - run this on the Mac itself (ssh cannot read it)" \
+      || echo "not signed in - run: claude"
+    return
+  fi
+  exp=$(cred_expiry "$cred"); now=$(date +%s)   # BSD awk has no systime()
+  if [ "${exp:-0}" != "0" ] && awk -v e="$exp" -v n="$now" 'BEGIN { exit !(e/1000 < n) }'; then
+    if keychain_item_present && [ -z "$(keychain_cred)" ]; then
+      echo "Keychain is locked - run this on the Mac itself (ssh cannot read it)"
+    else
+      echo "OAuth token expired - run: claude   (it refreshes on start)"
+    fi
+    return
+  fi
+  echo "could not reach the usage API"
+}
+
+codex_hint() {
+  [ -f "$CODEX_CREDS" ] || { echo "not signed in - run: codex login"; return; }
+  echo "could not reach the usage API - if this persists, run: codex login"
+}
+
+# ------------------------------------------------------------- rendering ----
+LBL=9
+
+quota_row() {   # label, percent, reset_epoch, now
+  local col trail=""
+  col=$(pct_color "$2")
+  [ "${3:-0}" -gt 0 ] && trail="${C_DIM}$(countdown $(( $3 - $4 )))${C_RESET}"
+  printf '  %-*s %s %s%5.1f%%%s  %s\n' "$LBL" "$1" "$(bar "$2" 16)" "$col" "$2" "$C_RESET" "$trail"
+}
+
+quota_section() {   # title, color, status, rows-fn, note-fn, cache, hint-fn
+  local title=$1 color=$2 status=$3 rowsfn=$4 notefn=$5 cache=$6 hintfn=$7 now tag="" got=0
+  now=$(date +%s)
+  case "$status" in
+    stale)   tag="${C_YELLOW}stale${C_RESET}" ;;
+    missing) tag="${C_DIM}loading...${C_RESET}" ;;
+  esac
+  printf ' %s%s%s %s\n' "$C_BOLD$color" "$title" "$C_RESET" "$tag"
+  if [ "$status" = "missing" ]; then
+    printf '  %s%s%s\n' "$C_YELLOW" "$("$hintfn")" "$C_RESET"
+    return
+  fi
+  local label pct reset
+  while IFS=$'\t' read -r label pct reset; do
+    [ -n "$label" ] || continue
+    got=1; quota_row "$label" "$pct" "${reset:-0}" "$now"
+  done < <("$rowsfn")
+  [ "$got" = "1" ] || printf '  %sno active limits reported%s\n' "$C_DIM" "$C_RESET"
+  local note; note=$("$notefn")
+  [ -n "$note" ] && printf '  %-*s %s%s%s\n' "$LBL" "" "$C_DIM" "$note" "$C_RESET"
+  printf '  %-*s %s%s ago%s\n' "$LBL" "" "$C_DIM" "$(human_age "$(file_age "$cache")")" "$C_RESET"
+}
+
+breakdown_section() {   # title, kind, total_tokens
+  local title=$1 kind=$2 total=$3 name tok cost msgs pad share
+  printf ' %s%s%s\n' "$C_BOLD" "$title" "$C_RESET"
+  local got=0
+  while IFS=$'\t' read -r _ name tok cost msgs pad; do
+    [ -n "$name" ] || continue
+    got=1
+    share=$(awk -v t="$tok" -v a="$total" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
+    printf '  %s %s %s%5.1f%%%s  %7s  %s$%.2f%s\n' \
+      "${pad:-$name}" "$(bar "$share" 10)" "$(pct_color "$share")" "$share" "$C_RESET" \
+      "$(human_tok "$tok")" "$C_DIM" "$cost" "$C_RESET"
+  done < <(local_rows "$kind")
+  [ "$got" = "1" ] || printf '  %sno activity in this window%s\n' "$C_DIM" "$C_RESET"
+}
+
+render() {
+  local force=${1:-0} cs xs ls
+  cs=$(ensure claude "$QUOTA_TTL" "$force")
+  xs=$(ensure codex  "$QUOTA_TTL" "$force")
+  ls=$(ensure local  "$LOCAL_TTL" "$force")
+
+  printf '%s┌ AI Usage%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(date '+%H:%M:%S')" "$C_RESET"
+  quota_section "CLAUDE" "$C_CYAN"    "$cs" claude_rows claude_note "$CACHE_DIR/claude.json" claude_hint
+  printf '\n'
+  quota_section "CODEX"  "$C_MAGENTA" "$xs" codex_rows  codex_note  "$CACHE_DIR/codex.json" codex_hint
+  printf '\n'
+
+  local range total ttok tcost tmsgs
+  [ "$DAYS" = "1" ] && range="today" || range="${DAYS}d"
+  IFS=$'\t' read -r _ _ tok cost msgs _ < <(local_rows TOTAL)
+  tok=${tok:-0}; cost=${cost:-0}; msgs=${msgs:-0}
+  if [ "$ls" = "missing" ]; then
+    printf ' %sBREAKDOWN%s %s(%s) scanning transcripts...%s\n' \
+      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
+  else
+    printf ' %sWHERE%s %s(%s - %s tok, ~$%.2f, %s msgs; $ estimated)%s\n' \
+      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$tok")" "$cost" "$msgs" "$C_RESET"
+    breakdown_section "" PROJ "$tok" | tail -n +2
+    printf '\n'
+    printf ' %sWHAT%s %s(%s - by model)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
+    breakdown_section "" MODEL "$tok" | tail -n +2
+  fi
+
+  [ "$ONCE" = "0" ] && printf '\n %s[q] quit  [r] refetch  [d] %s  -  api %ss, local %ss%s\n' \
+    "$C_DIM" "$([ "$DAYS" = "1" ] && echo "7 days" || echo "today")" "$QUOTA_TTL" "$LOCAL_TTL" "$C_RESET"
+  return 0
+}
+
+# ------------------------------------------------------------ self-test ----
+self_test() {
+  local status=0
+  SELFTEST_TMP=$(mktemp -d); trap 'rm -rf "$SELFTEST_TMP"' EXIT
+  local tmp=$SELFTEST_TMP saved=$CACHE_DIR
+  CACHE_DIR=$tmp
+
+  check() {
+    if [ "$2" = "$3" ]; then printf '  %sok%s   %s\n' "$(pct_color 10)" "$C_RESET" "$1"
+    else printf '  %sFAIL%s %s\n        got      [%s]\n        expected [%s]\n' \
+           "$C_RED" "$C_RESET" "$1" "$2" "$3"; status=1; fi
+  }
+
+  echo "self-test: claude quota parsing"
+  cat > "$tmp/claude.json" <<'J'
+{"limits":[
+ {"kind":"session","percent":7,"severity":"normal","resets_at":"2026-09-15T05:20:00.270019+00:00","scope":null},
+ {"kind":"weekly_all","percent":56,"severity":"normal","resets_at":"2026-09-18T02:00:00.270043+00:00","scope":null},
+ {"kind":"weekly_scoped","percent":49,"severity":"normal","resets_at":"2026-09-18T02:00:00.270043+00:00","scope":{"model":{"display_name":"Fable"}}},
+ {"kind":"broken","percent":null,"resets_at":null,"scope":null}],
+ "spend":{"enabled":false,"used":{"amount_minor":0,"exponent":2}}}
+J
+  check "null percent dropped" "$(claude_rows | wc -l | tr -d ' ')" "3"
+  check "session -> 5h"        "$(claude_rows | sed -n 1p | cut -f1,2)" "$(printf '5h\t7')"
+  check "weekly_all -> weekly" "$(claude_rows | sed -n 2p | cut -f1,2)" "$(printf 'weekly\t56')"
+  check "scoped -> model name" "$(claude_rows | sed -n 3p | cut -f1,2)" "$(printf 'fable\t49')"
+  check "resets_at -> epoch"   "$(claude_rows | sed -n 1p | cut -f3)" "1789449600"
+
+  echo "self-test: codex quota parsing"
+  cat > "$tmp/codex.json" <<'J'
+{"plan_type":"team","rate_limit":{"primary_window":{"used_percent":23,"limit_window_seconds":604800,"reset_at":1789968528},
+ "secondary_window":{"used_percent":4,"limit_window_seconds":18000,"reset_at":1789450000}},
+ "credits":{"unlimited":false,"balance":null},"rate_limit_reset_credits":{"available_count":3},
+ "spend_control":{"reached":false}}
+J
+  check "two windows"        "$(codex_rows | wc -l | tr -d ' ')" "2"
+  check "604800 -> weekly"   "$(codex_rows | sed -n 1p)" "$(printf 'weekly\t23\t1789968528')"
+  check "18000 -> 5h"        "$(codex_rows | sed -n 2p)" "$(printf '5h\t4\t1789450000')"
+  check "codex note"         "$(codex_note)" "plan team  reset credits 3"
+
+  echo "self-test: local aggregation"
+  mkdir -p "$tmp/cc/p"
+  local today; today=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+  # opus-5 (1000 in, 1000 out, 1000 5m-write, 10000 read) = $0.04125, written twice
+  # sonnet-5 (1000 in, 1000 out) = $0.012 ; <synthetic> ignored -> $0.05325 / 15000 tok
+  {
+    printf '{"timestamp":"%s","cwd":"/work/alpha","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":1000,"output_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":10000}}}\n' "$today"
+    printf '{"timestamp":"%s","cwd":"/work/alpha","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":1000,"output_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":1000,"ephemeral_1h_input_tokens":0},"cache_read_input_tokens":10000}}}\n' "$today"
+    printf '{"timestamp":"%s","cwd":"/work/beta","requestId":"r2","message":{"id":"m2","model":"claude-sonnet-5","usage":{"input_tokens":1000,"output_tokens":1000,"cache_read_input_tokens":0}}}\n' "$today"
+    printf '{"timestamp":"%s","cwd":"/work/beta","requestId":"r3","message":{"id":"m3","model":"<synthetic>","usage":{"input_tokens":999999,"output_tokens":999999}}}\n' "$today"
+    printf '{"timestamp":"2020-01-01T00:00:00.000Z","cwd":"/work/old","requestId":"r4","message":{"id":"m4","model":"claude-opus-5","usage":{"input_tokens":500000,"output_tokens":500000}}}\n'
+  } > "$tmp/cc/p/s.jsonl"
+  local agg; agg=$(python3 "$AGG" "$tmp/cc" 1)
+  check "total tokens (deduped, synthetic + old excluded)" \
+    "$(echo "$agg" | awk -F'\t' '$1=="TOTAL"{print $3}')" "15000"
+  check "total cost"  "$(echo "$agg" | awk -F'\t' '$1=="TOTAL"{printf "%.4f", $4}')" "0.0533"
+  check "messages"    "$(echo "$agg" | awk -F'\t' '$1=="TOTAL"{print $5}')" "2"
+  check "top project" "$(echo "$agg" | awk -F'\t' '$1=="PROJ"{print $2; exit}')" "alpha"
+  check "two projects" "$(echo "$agg" | grep -c '^PROJ')" "2"
+  check "two models"   "$(echo "$agg" | grep -c '^MODEL')" "2"
+
+  echo "self-test: credential source selection"
+  printf '{"claudeAiOauth":{"expiresAt":1000000000000,"accessToken":"file-old"}}\n' > "$tmp/creds-old.json"
+  printf '{"claudeAiOauth":{"expiresAt":99999999999999,"accessToken":"file-new"}}\n' > "$tmp/creds-ok.json"
+  keychain_item_present() { return 1; }
+  keychain_cred() { return 1; }
+  check "no keychain -> file used" \
+    "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_cred | jq -r .claudeAiOauth.accessToken)" "file-new"
+  keychain_cred() { printf '{"claudeAiOauth":{"expiresAt":99999999999999,"accessToken":"kc-new"}}'; }
+  keychain_item_present() { return 0; }
+  check "fresh keychain beats stale file" \
+    "$(CLAUDE_CREDS=$tmp/creds-old.json claude_cred | jq -r .claudeAiOauth.accessToken)" "kc-new"
+  keychain_cred() { printf '{"claudeAiOauth":{"expiresAt":1000000000000,"accessToken":"kc-old"}}'; }
+  check "fresh file beats stale keychain" \
+    "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_cred | jq -r .claudeAiOauth.accessToken)" "file-new"
+
+  echo "self-test: failure hints"
+  keychain_cred() { return 1; }; keychain_item_present() { return 1; }
+  check "expired, no keychain" \
+    "$(CLAUDE_CREDS=$tmp/creds-old.json claude_hint)" \
+    "OAuth token expired - run: claude   (it refreshes on start)"
+  check "valid token -> network hint" \
+    "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_hint)" "could not reach the usage API"
+  check "no creds at all" \
+    "$(CLAUDE_CREDS=$tmp/nope.json claude_hint)" "not signed in - run: claude"
+  keychain_item_present() { return 0; }
+  check "locked keychain named" \
+    "$(CLAUDE_CREDS=$tmp/nope.json claude_hint)" \
+    "Keychain is locked - run this on the Mac itself (ssh cannot read it)"
+  check "stale file + locked keychain" \
+    "$(CLAUDE_CREDS=$tmp/creds-old.json claude_hint)" \
+    "Keychain is locked - run this on the Mac itself (ssh cannot read it)"
+
+  echo "self-test: display helpers"
+  check "human_tok 1500000"  "$(human_tok 1500000)"  "1.5M"
+  check "countdown 262351"   "$(countdown 262351)"   "3d 00:52:31"
+  check "countdown 14892"    "$(countdown 14892)"    "4:08:12"
+  check "countdown 91"       "$(countdown 91)"       "1:31"
+  check "win_label 604800"   "$(win_label 604800)"   "weekly"
+  check "bar plain 50/10"    "$(NO_COLOR=1 COLOR=0 bar 50 10)" "█████░░░░░"
+  check "ramp low != high"   "$([ "$(ramp 10 1)" != "$(ramp 95 1)" ] && echo 1)" "1"
+  check "ramp has 7 stops"   "$(for p in 5 25 40 55 70 85 95; do ramp $p 1; echo; done | sort -u | wc -l | tr -d ' ')" "7"
+
+  CACHE_DIR=$saved
+  [ "$status" = "0" ] && echo "all checks passed" || echo "some checks failed"
+  return $status
+}
+
+# ---------------------------------------------------------------- modes ----
+case "$MODE" in
+  selftest) self_test; exit $? ;;
+  json)
+    ensure claude "$QUOTA_TTL" 1 >/dev/null; ensure codex "$QUOTA_TTL" 1 >/dev/null
+    jq -n --slurpfile c "$CACHE_DIR/claude.json" --slurpfile x "$CACHE_DIR/codex.json" \
+      '{claude: ($c[0] // null), codex: ($x[0] // null)}' 2>/dev/null
+    exit 0 ;;
+esac
+
+if [ "$ONCE" = "1" ] || [ ! -t 1 ] || [ ! -t 0 ]; then
+  render 0; exit 0
+fi
+
+cleanup() { tput rmcup 2>/dev/null; tput cnorm 2>/dev/null; printf '%s' "$C_RESET"; }
+trap 'cleanup; exit 0' INT TERM
+tput smcup 2>/dev/null; tput civis 2>/dev/null
+
+force=0
+while :; do
+  frame=$(render "$force"); force=0
+  printf '\033[H'
+  printf '%s' "$frame" | while IFS= read -r line || [ -n "$line" ]; do printf '%s\033[K\n' "$line"; done
+  printf '\033[J'
+  if read -rsn1 -t "$INTERVAL" key 2>/dev/null; then
+    case "$key" in
+      q|Q) break ;;
+      r|R) force=1 ;;
+      d|D) [ "$DAYS" = "1" ] && DAYS=7 || DAYS=1 ;;
+    esac
+  fi
+done
+cleanup
