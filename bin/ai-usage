@@ -593,6 +593,20 @@ render() {
   return 0
 }
 
+# A frame taller than the window scrolls, and what scrolls away is the top -
+# exactly the quota lines worth keeping. Clip from the bottom instead.
+term_rows() { printf '%s' "${AI_USAGE_ROWS:-$(tput lines 2>/dev/null || echo 24)}"; }
+
+clip_frame() {   # stdin -> at most $1 lines, with a marker when anything was cut
+  awk -v max="$1" '
+    { lines[NR] = $0 }
+    END {
+      if (NR <= max) { for (i = 1; i <= NR; i++) print lines[i]; exit }
+      for (i = 1; i < max; i++) print lines[i]
+      printf "  ... %d more line(s) - make the window taller\n", NR - max + 1
+    }'
+}
+
 # --------------------------------------------------------------- report ----
 # One machine-readable snapshot per account, so a GUI front end never has to
 # re-derive the parsing, pricing or aggregation done here.
@@ -925,6 +939,17 @@ J
        | grep -c 'API shape may')" "1"
   ACCT_ID=a0
 
+  echo "self-test: small windows"
+  local long; long=$(printf 'l%s\n' 1 2 3 4 5 6 7 8 9 10)
+  check "short frames pass through" \
+    "$(printf 'a\nb\n' | clip_frame 10 | wc -l | tr -d ' ')" "2"
+  check "a tall frame is cut to the window" \
+    "$(printf '%s\n' "$long" | clip_frame 4 | wc -l | tr -d ' ')" "4"
+  check "the top survives, not the bottom" \
+    "$(printf '%s\n' "$long" | clip_frame 4 | sed -n 1p)" "l1"
+  check "and it says what was cut" \
+    "$(printf '%s\n' "$long" | clip_frame 4 | tail -1 | grep -c 'more line')" "1"
+
   echo "self-test: display helpers"
   check "human_tok 1500000"  "$(human_tok 1500000)"  "1.5M"
   check "countdown 262351"   "$(countdown 262351)"   "3d 00:52:31"
@@ -975,7 +1000,8 @@ force=0
 while :; do
   frame=$(render "$force"); force=0
   printf '\033[H'
-  printf '%s' "$frame" | while IFS= read -r line || [ -n "$line" ]; do printf '%s\033[K\n' "$line"; done
+  printf '%s\n' "$frame" | clip_frame "$(term_rows)" \
+    | while IFS= read -r line || [ -n "$line" ]; do printf '%s\033[K\n' "$line"; done
   printf '\033[J'
   if read -rsn1 -t "$INTERVAL" key 2>/dev/null; then
     case "$key" in
