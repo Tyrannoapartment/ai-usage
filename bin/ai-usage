@@ -595,17 +595,20 @@ render() {
 
 # A frame taller than the window scrolls, and what scrolls away is the top -
 # exactly the quota lines worth keeping. Clip from the bottom instead.
-term_rows() { printf '%s' "${AI_USAGE_ROWS:-$(tput lines 2>/dev/null || echo 24)}"; }
-
-clip_frame() {   # stdin -> at most $1 lines, with a marker when anything was cut
-  awk -v max="$1" '
-    { lines[NR] = $0 }
-    END {
-      if (NR <= max) { for (i = 1; i <= NR; i++) print lines[i]; exit }
-      for (i = 1; i < max; i++) print lines[i]
-      printf "  ... %d more line(s) - make the window taller\n", NR - max + 1
-    }'
+#
+# The size has to come from /dev/tty: inside $(...) stdout is a pipe, so tput
+# cannot ioctl the terminal and quietly answers with terminfo's default 24 -
+# which is why resizing the window appeared to change nothing.
+term_rows() {
+  local r
+  if [ -n "${AI_USAGE_ROWS:-}" ]; then printf '%s' "$AI_USAGE_ROWS"; return; fi
+  r=$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f1)
+  [ -n "$r" ] && [ "$r" -gt 0 ] 2>/dev/null || r=$(tput lines < /dev/tty 2>/dev/null)
+  [ -n "$r" ] && [ "$r" -gt 0 ] 2>/dev/null || r=24
+  printf '%s' "$r"
 }
+
+clip_frame() { awk -v max="$1" 'NR <= max'; }
 
 # --------------------------------------------------------------- report ----
 # One machine-readable snapshot per account, so a GUI front end never has to
@@ -947,8 +950,10 @@ J
     "$(printf '%s\n' "$long" | clip_frame 4 | wc -l | tr -d ' ')" "4"
   check "the top survives, not the bottom" \
     "$(printf '%s\n' "$long" | clip_frame 4 | sed -n 1p)" "l1"
-  check "and it says what was cut" \
-    "$(printf '%s\n' "$long" | clip_frame 4 | tail -1 | grep -c 'more line')" "1"
+  check "nothing is appended to the frame" \
+    "$(printf '%s\n' "$long" | clip_frame 4 | tail -1)" "l4"
+  check "a resized window is read from the tty, not a stale default" \
+    "$(AI_USAGE_ROWS=40 term_rows)" "40"
 
   echo "self-test: display helpers"
   check "human_tok 1500000"  "$(human_tok 1500000)"  "1.5M"

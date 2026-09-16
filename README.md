@@ -35,8 +35,8 @@ and, for Claude, where it went.
 
 The countdowns tick every second. Network calls and transcript scans happen in
 the background, so the clock never stalls on them. In a window too short for the
-whole frame the quota stays put and the breakdown is what gets cut, with a line
-saying how much.
+whole frame the quota stays put and the breakdown is what gets cut; the frame
+follows the window as you resize it.
 
 ## What is real and what is estimated
 
@@ -215,7 +215,7 @@ at it.
 ./test/run-tests.sh
 ```
 
-57 checks over fixtures, no network: quota parsing for both vendors,
+58 checks over fixtures, no network: quota parsing for both vendors,
 credential-source selection (Keychain vs. file, newest token wins), failure
 hints, token aggregation and de-duplication, pricing, and the display helpers.
 
