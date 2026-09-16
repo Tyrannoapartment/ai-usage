@@ -368,11 +368,19 @@ ensure() {   # name, ttl, force -> echoes ok | stale | missing
 CLAUDE_ROWS_JQ='
 def epoch: if . == null then 0
            else (sub("\\.[0-9]+";"") | sub("\\+00:00";"Z") | fromdateiso8601) end;
+# Other plans return limit kinds this build has never seen
+# (seven_day_opus, oauth_apps, ...). Shorten them into the same column width
+# rather than letting a raw key push every number out of line.
+def pretty:
+  if . == "session" then "5h"
+  elif . == "weekly_all" then "weekly"
+  else (sub("^seven_day_?"; "7d ") | sub("^five_hour_?"; "5h ")
+        | gsub("_"; " ") | .[0:8] | sub(" +$"; ""))
+  end;
 (.limits // []) | map(select(.percent != null)) | .[]
-| [ (if .kind == "session" then "5h"
-     elif .kind == "weekly_all" then "weekly"
-     elif .scope.model.display_name != null then (.scope.model.display_name | ascii_downcase)
-     else .kind end),
+| [ (if .scope.model.display_name != null
+     then (.scope.model.display_name | ascii_downcase | .[0:8])
+     else (.kind | pretty) end),
     .percent, (.resets_at | epoch) ] | @tsv'
 
 CODEX_ROWS_JQ='
@@ -761,6 +769,24 @@ J
   check "weekly_all -> weekly" "$(claude_rows | sed -n 2p | cut -f1,2)" "$(printf 'weekly\t56')"
   check "scoped -> model name" "$(claude_rows | sed -n 3p | cut -f1,2)" "$(printf 'fable\t49')"
   check "resets_at -> epoch"   "$(claude_rows | sed -n 1p | cut -f3)" "1789449600"
+
+  echo "self-test: limit kinds from other plans"
+  cat > "$tmp/a0-claude.json" <<'J'
+{"limits":[
+ {"kind":"session","percent":12,"resets_at":null,"scope":null},
+ {"kind":"seven_day","percent":30,"resets_at":null,"scope":null},
+ {"kind":"seven_day_opus","percent":44,"resets_at":null,"scope":null},
+ {"kind":"seven_day_oauth_apps","percent":3,"resets_at":null,"scope":null},
+ {"kind":"weekly_scoped","percent":51,"resets_at":null,
+  "scope":{"model":{"display_name":"SomeVeryLongModelName"}}}]}
+J
+  check "session stays 5h"    "$(claude_rows | sed -n 1p | cut -f1)" "5h"
+  check "seven_day -> 7d"     "$(claude_rows | sed -n 2p | cut -f1)" "7d"
+  check "model-scoped weekly" "$(claude_rows | sed -n 3p | cut -f1)" "7d opus"
+  check "long kind is clipped, not overflowing" \
+    "$(claude_rows | sed -n 4p | cut -f1 | wc -c | tr -d ' ')" "9"
+  check "long model name clipped too" \
+    "$(claude_rows | sed -n 5p | cut -f1)" "somevery"
 
   echo "self-test: codex quota parsing"
   cat > "$tmp/a0-codex.json" <<'J'

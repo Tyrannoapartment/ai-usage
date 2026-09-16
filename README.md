@@ -197,6 +197,10 @@ at it.
   not a published API, and either vendor can change the response shape. When
   that happens a section renders as "no active limits reported"; `--json` shows
   the raw payload so you can see what moved.
+- **Only a Team plan has been exercised end to end.** Other plans return limit
+  kinds this build has never seen (`seven_day_opus`, `seven_day_oauth_apps`, …).
+  They render — the names are shortened to fit the column — but the wording is
+  whatever the API sends.
 - **Codex reports whichever windows it wants.** Right now that is often a single
   weekly window. A 5-hour window renders automatically if the server starts
   sending one.
@@ -209,7 +213,7 @@ at it.
 ./test/run-tests.sh
 ```
 
-44 checks over fixtures, no network: quota parsing for both vendors,
+53 checks over fixtures, no network: quota parsing for both vendors,
 credential-source selection (Keychain vs. file, newest token wins), failure
 hints, token aggregation and de-duplication, pricing, and the display helpers.
 
