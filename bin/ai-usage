@@ -220,9 +220,10 @@ brand_color() {
     case "$1" in
       claude) printf '\033[38;5;173m' ;;   # nearest to #D97757
       codex)  printf '\033[38;5;36m'  ;;   # nearest to #10A37F
+      grok)   printf '\033[38;5;252m' ;;   # xAI's mark is monochrome
     esac
   else
-    case "$1" in claude) printf '\033[33m' ;; codex) printf '\033[36m' ;; esac
+    case "$1" in claude) printf '\033[33m' ;; codex) printf '\033[36m' ;; grok) printf '\033[37m' ;; esac
   fi
 }
 
@@ -231,12 +232,15 @@ EPOCH_BASE=$(date +%s)
 SECONDS=0
 now_epoch() { echo $(( EPOCH_BASE + SECONDS )); }
 
+GROK_DIR=${AI_USAGE_GROK_DIR:-$HOME/.grok/sessions}
+
 GLYPHS=${AI_USAGE_GLYPHS:-1}
 brand_mark() {
   if [ "$GLYPHS" = "1" ]; then
     case "$1" in
       claude) printf '\342\234\263' ;;   # U+2733, closest to the Claude mark
-      codex)  printf '\342\235\213' ;;   # U+274B, reads like the OpenAI knot
+      codex)  printf '\342\235\213' ;;
+      grok)   printf '\342\234\246' ;;   # U+2726, standing in for the xAI mark   # U+274B, reads like the OpenAI knot
     esac
   else
     printf '%s' "$1"
@@ -396,7 +400,7 @@ producer_codex() {
   printf '%s' "$body" | sed '$d' | jq -e . 2>/dev/null
 }
 
-producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" "$CODEX_DIR" 2>/dev/null; }
+producer_local() { python3 "$AGG" "$CLAUDE_DIR" "$DAYS" "$CODEX_DIR" "$GROK_DIR" 2>/dev/null; }
 
 cache_file() {
   case "$1" in
@@ -712,15 +716,22 @@ usage_rows() {   # $1 = labelled (1/0) -> breakdown groups for the current accou
   printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
   breakdown_section "" MODEL "$tok" | tail -n +2 | sed 's/^/     /'
 
-  IFS=$'\t' read -r _ _ cxtok _ msgs _ < <(local_rows CODEX_TOTAL)
-  [ "${cxtok:-0}" -gt 0 ] || return 0
-  printf '   %s%s codex%s %s(%s tok  %s msgs  tokens only - no public price)%s\n' \
-    "$(brand_color codex)" "$(brand_mark codex)" "$C_RESET" "$C_DIM" \
-    "$(human_tok "$cxtok")" "${msgs:-0}" "$C_RESET"
-  printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
-  breakdown_section "" CODEX_PROJ "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
-  printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
-  breakdown_section "" CODEX_MODEL "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
+  local other tot omsgs
+  for other in codex grok; do
+    case "$other" in
+      codex) tot=CODEX_TOTAL ;;
+      grok)  tot=GROK_TOTAL ;;
+    esac
+    IFS=$'\t' read -r _ _ cxtok _ omsgs _ < <(local_rows "$tot")
+    [ "${cxtok:-0}" -gt 0 ] || continue
+    printf '   %s%s %s%s %s(%s tok  %s msgs  tokens only - no public price)%s\n' \
+      "$(brand_color "$other")" "$(brand_mark "$other")" "$other" "$C_RESET" "$C_DIM" \
+      "$(human_tok "$cxtok")" "${omsgs:-0}" "$C_RESET"
+    printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
+    breakdown_section "" "${tot%_TOTAL}_PROJ" "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
+    printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
+    breakdown_section "" "${tot%_TOTAL}_MODEL" "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
+  done
 }
 
 render() {
@@ -779,8 +790,12 @@ breakdown_for() {   # $1 = days
     --argjson cx_projects "$(local_rows CODEX_PROJ | rows_json)" \
     --argjson cx_models "$(local_rows CODEX_MODEL | rows_json)" \
     --argjson cx_total "$(local_rows CODEX_TOTAL | total_json)" \
+    --argjson gk_projects "$(local_rows GROK_PROJ | rows_json)" \
+    --argjson gk_models "$(local_rows GROK_MODEL | rows_json)" \
+    --argjson gk_total "$(local_rows GROK_TOTAL | total_json)" \
     '{claude: {total: $total, projects: $projects, models: $models, unpriced: $unpriced},
-      codex:  {total: $cx_total, projects: $cx_projects, models: $cx_models, unpriced: []}}'
+      codex:  {total: $cx_total, projects: $cx_projects, models: $cx_models, unpriced: []},
+        grok:   {total: $gk_total, projects: $gk_projects, models: $gk_models, unpriced: []}}'
 }
 
 account_report() {

@@ -12,13 +12,13 @@ Emits TSV:  KIND \t name \t tokens \t cost \t messages \t padded-name \t priced
 `priced` is 0 when no published rate is known for that model, in which case
 `cost` is 0 and the totals are a floor rather than an estimate.
 
-KIND is TOTAL / PROJ / MODEL for Claude and CODEX_TOTAL / CODEX_PROJ /
-CODEX_MODEL for Codex.
+KIND is TOTAL / PROJ / MODEL for Claude, and the same three prefixed with
+CODEX_ or GROK_ for the other two.
 
 The padded name is pre-fitted to a fixed number of terminal columns, counting
 East Asian wide characters as two, so the caller can print it verbatim.
 """
-import json, os, sys, time, unicodedata
+import json, os, sys, time, unicodedata, urllib.parse
 
 NAME_COLS = 24
 
@@ -146,11 +146,81 @@ def scan_codex(root, start):
     return projects, models, total_tok, total_msgs
 
 
+def scan_grok(root, start):
+    """Grok writes one usage record per turn, and they sum to the session total.
+
+    Each record carries a millisecond timestamp, so turns land in the right
+    window even when a session spans days. xAI publishes no per-token rate for
+    the subscription, and the cost it records is in undocumented "ticks", so
+    these rows report tokens only.
+    """
+    projects, models = {}, {}
+    total_tok = total_msgs = 0
+    start_ms = start * 1000
+
+    for cwd_entry in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        cwd_dir = os.path.join(root, cwd_entry)
+        if not os.path.isdir(cwd_dir):
+            continue
+        # Directory names are the percent-encoded working directory.
+        decoded = urllib.parse.unquote(cwd_entry)
+        proj = os.path.basename(decoded.rstrip("/")) or "~"
+
+        for session in sorted(os.listdir(cwd_dir)):
+            updates = os.path.join(cwd_dir, session, "updates.jsonl")
+            try:
+                if os.path.getmtime(updates) < start - 86400:
+                    continue
+            except OSError:
+                continue
+            try:
+                fh = open(updates, "r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with fh as f:
+                for line in f:
+                    if '"usage"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    params = rec.get("params") or {}
+                    usage = (params.get("update") or {}).get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    tok = usage.get("totalTokens") or 0
+                    if not tok:
+                        continue
+                    stamp = (params.get("_meta") or {}).get("agentTimestampMs")
+                    if not isinstance(stamp, (int, float)) or stamp < start_ms:
+                        continue
+
+                    p = projects.setdefault(proj, [0, 0.0, 0])
+                    p[0] += tok; p[2] += 1
+                    per_model = usage.get("modelUsage")
+                    if isinstance(per_model, dict) and per_model:
+                        for name, stats in per_model.items():
+                            if not isinstance(stats, dict):
+                                continue
+                            m = models.setdefault(name, [0, 0.0, 0])
+                            m[0] += stats.get("totalTokens") or 0
+                            m[2] += 1
+                    else:
+                        m = models.setdefault("grok", [0, 0.0, 0])
+                        m[0] += tok; m[2] += 1
+                    total_tok += tok; total_msgs += 1
+
+    return projects, models, total_tok, total_msgs
+
+
 def main():
     root = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/.claude/projects")
     days = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
     codex_root = os.path.expanduser(
         sys.argv[3] if len(sys.argv) > 3 else "~/.codex/sessions")
+    grok_root = os.path.expanduser(
+        sys.argv[4] if len(sys.argv) > 4 else "~/.grok/sessions")
 
     now = time.time()
     start = window(days)
@@ -246,6 +316,10 @@ def main():
     if os.path.isdir(codex_root):
         cx_projects, cx_models, cx_tok, cx_msgs = scan_codex(codex_root, start)
 
+    gk_projects, gk_models, gk_tok, gk_msgs = ({}, {}, 0, 0)
+    if os.path.isdir(grok_root):
+        gk_projects, gk_models, gk_tok, gk_msgs = scan_grok(grok_root, start)
+
     out = sys.stdout
 
     def emit(kind, name, tok, cost, msgs, priced=1):
@@ -267,6 +341,12 @@ def main():
     # Codex publishes no per-token rate for subscription plans at all.
     emit("CODEX_TOTAL", "all", cx_tok, 0.0, cx_msgs, 0)
     for kind, table in (("CODEX_PROJ", cx_projects), ("CODEX_MODEL", cx_models)):
+        for name, (tok, cost, msgs) in sorted(
+                table.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
+            emit(kind, name, tok, cost, msgs, 0)
+
+    emit("GROK_TOTAL", "all", gk_tok, 0.0, gk_msgs, 0)
+    for kind, table in (("GROK_PROJ", gk_projects), ("GROK_MODEL", gk_models)):
         for name, (tok, cost, msgs) in sorted(
                 table.items(), key=lambda kv: kv[1][0], reverse=True)[:5]:
             emit(kind, name, tok, cost, msgs, 0)

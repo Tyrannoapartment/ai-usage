@@ -1,6 +1,6 @@
 {
   "name": "@tyrannoapartment/ai-usage",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Live terminal dashboard for Claude and Codex quota usage, with a per-project and per-model breakdown",
   "keywords": ["claude", "codex", "quota", "usage", "rate-limit", "tui", "cli", "dashboard"],
   "homepage": "https://github.com/Tyrannoapartment/ai-usage#readme",

@@ -52,7 +52,8 @@ Each token is sent only to its own vendor, over HTTPS, and nothing is written
 anywhere except a quota cache under `~/.cache/ai-usage/`.
 
 The **WHERE** and **WHAT** sections are aggregated from local transcripts —
-`~/.claude/projects/` for Claude, `~/.codex/sessions/` for Codex. Their token
+`~/.claude/projects/` for Claude, `~/.codex/sessions/` for Codex,
+`~/.grok/sessions/` for Grok. Their token
 counts are exact: read straight out of each turn's usage record, de-duplicated
 by message and request id.
 
@@ -60,8 +61,12 @@ by message and request id.
 plans report no dollar figures, so Claude tokens are priced at public API rates.
 A model with no published rate contributes its tokens but no cost and is marked
 `no published rate`, which makes the total a floor rather than a guess — the
-tool will not invent a price for a model it does not know. Codex publishes no
-per-token rate for subscription plans at all, so its rows carry tokens only.
+tool will not invent a price for a model it does not know. Codex and Grok publish no
+per-token rate for their subscriptions, so their rows carry tokens only - Grok
+does record a cost, but in undocumented "ticks", so it is left alone.
+
+Grok has no quota endpoint either, so it appears in the breakdown but not among
+the limits.
 
 If an endpoint answers `429`, the tool says so and stops calling it for five
 minutes rather than hammering through a rate limit.

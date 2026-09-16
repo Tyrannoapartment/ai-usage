@@ -46,6 +46,8 @@ struct Breakdown: Decodable {
 struct Window: Decodable {
     let claude: Breakdown
     let codex: Breakdown
+    // Grok has no quota endpoint, so it shows up in the breakdown only.
+    let grok: Breakdown?
 }
 
 struct Windows: Decodable {
@@ -876,8 +878,8 @@ final class Controller: NSObject, NSMenuDelegate {
 
     private func renderWindow(_ title: String, _ window: Window) {
         let claude = window.claude, codex = window.codex
-        var summary = title + "   " + Format.tokens(claude.total.tokens + codex.total.tokens)
-            + " tok"
+        let others = codex.total.tokens + (window.grok?.total.tokens ?? 0)
+        var summary = title + "   " + Format.tokens(claude.total.tokens + others) + " tok"
         if claude.total.cost > 0 {
             // A model with no published rate contributes tokens but no cost,
             // so the figure is a floor rather than an estimate.
@@ -887,7 +889,9 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.addItem(header(summary))
 
         // Everything is laid out at once - nothing hides behind a toggle.
-        for (name, data) in [("claude", claude), ("codex", codex)] {
+        var sources: [(String, Breakdown)] = [("claude", claude), ("codex", codex)]
+        if let grok = window.grok { sources.append(("grok", grok)) }
+        for (name, data) in sources {
             guard data.total.tokens > 0 else { continue }
             menu.addItem(row("  \(name) - sessions", color: .secondaryLabelColor))
             entryRows(data.projects, of: data.total.tokens)
