@@ -8,29 +8,28 @@ A terminal dashboard for how much of your Claude and Codex quota you have left �
 and, for Claude, where it went.
 
 ```
-┌ AI Usage  10:39:25
+┌ AI Usage  14:24:04
 
- CLAUDE
-  5h        ██░░░░░░░░░░░░░░  14.0%  3:40:35
-  weekly    █████████░░░░░░░  56.0%  3d 00:20:35
-  fable     ████████░░░░░░░░  49.0%  3d 00:20:35
-            plan pro   12s ago
+ LIMITS
+   claude 5h       ░░░░░░░░░░░░   0.0%  4:55:56
+   claude weekly   ██████████░░  81.0%  1d 20:35:56
+   claude fable    ██████░░░░░░  54.0%  1d 20:35:56
+          pro  1m ago
+   codex  weekly   █████░░░░░░░  41.0%  5d 00:04:44
+          plan team  reset credits 3  22s ago
 
- CODEX
-  weekly    ████░░░░░░░░░░░░  23.0%  6d 03:49:23
-            plan team  reset credits 3
+ USAGE · today
+   claude (366.1M tok  ~$257.12  836 msgs)
+     by project
+       api-gateway               45.7%   167.4M  $105.84
+       web-frontend              42.8%   156.7M  $105.91
+     by model
+       claude-opus-5             98.9%   362.0M  $248.01
+   codex (33.0M tok  292 msgs  no published rate)
+     by project
+       api-gateway              100.0%    33.0M
 
- WHERE (today - 62.1M tok, ~$41.28, 288 msgs; $ estimated)
-  api-gateway              █████████░  86.7%    53.8M  $33.43
-  web-frontend             █░░░░░░░░░  11.6%     7.2M  $7.00
-  infra-scripts            ░░░░░░░░░░   1.4%     882K  $0.59
-
- WHAT (today - by model)
-  claude-opus-5            ████████░░  75.0%    2.56B  $1687.43
-  claude-sonnet-5          ██░░░░░░░░  19.7%   672.7M  $175.38
-  claude-fable-5-1         ░░░░░░░░░░   4.9%   166.7M  $239.82
-
- [q] quit  [r] refetch  [d] 7 days  -  api 60s, local 90s
+ [q] quit  [r] refetch  [d] 7 days  [c] limits only
 ```
 
 The countdowns tick every second. Network calls and transcript scans happen in
@@ -98,6 +97,7 @@ Tools. Runs on stock `/bin/bash` 3.2.
 ```sh
 ai-usage                 # live dashboard
 ai-usage --days 7        # breakdown over 7 days instead of today
+ai-usage --compact       # limits only, no breakdown
 ai-usage --once          # print one frame and exit (pipes, cron, status bars)
 ai-usage --json          # raw merged quota JSON
 ai-usage --menubar       # one SwiftBar/xbar frame
@@ -110,6 +110,7 @@ ai-usage --self-test     # run the test suite
 | `q` | quit |
 | `r` | refetch immediately |
 | `d` | toggle today / 7 days |
+| `c` | toggle compact (limits only) |
 
 Options: `-i SECONDS` screen redraw (default 1), `--ttl SECONDS` how long a
 fetched quota is reused (default 60).
@@ -215,7 +216,7 @@ at it.
 ./test/run-tests.sh
 ```
 
-58 checks over fixtures, no network: quota parsing for both vendors,
+59 checks over fixtures, no network: quota parsing for both vendors,
 credential-source selection (Keychain vs. file, newest token wins), failure
 hints, token aggregation and de-duplication, pricing, and the display helpers.
 

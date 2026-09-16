@@ -16,6 +16,7 @@
 #
 #   ai-usage              live view; clock and countdowns tick every second
 #   ai-usage --days 7     breakdown over 7 days instead of today
+#   ai-usage --compact    limits only, no breakdown
 #   ai-usage --once       print one frame and exit
 #   ai-usage --json       raw merged quota JSON
 #   ai-usage --menubar    one SwiftBar/xbar frame (see extras/)
@@ -23,7 +24,7 @@
 #   ai-usage --self-test  verify parsing, colors and aggregation
 #
 # Options: -i SECONDS screen redraw, --ttl SECONDS quota reuse window
-# Keys:    q quit   r refetch now   d toggle today/7d
+# Keys:    q quit   r refetch now   d toggle today/7d   c toggle compact
 
 set -uo pipefail
 
@@ -63,7 +64,9 @@ INTERVAL=1      # screen redraw - keeps the countdowns live
 QUOTA_TTL=60    # how often the quota APIs are re-queried
 LOCAL_TTL=90    # how often local transcripts are re-aggregated
 RATE_LIMIT_COOLDOWN=300   # how long to stay off an endpoint after a 429
+FORCE_FETCH=0
 DAYS=1
+COMPACT=0
 ONCE=0
 MODE=live
 
@@ -76,6 +79,7 @@ while [ $# -gt 0 ]; do
     --days)        DAYS=$2; shift 2 ;;
     --once)        ONCE=1; shift ;;
     --json)        MODE=json; shift ;;
+    --compact)     COMPACT=1; shift ;;
     --menubar)     MODE=menubar; shift ;;
     --report)      MODE=report; shift ;;
     --self-test)   MODE=selftest; shift ;;
@@ -520,81 +524,11 @@ breakdown_section() {   # title, kind, total_tokens
   [ "$got" = "1" ] || printf '  %sno activity in this window%s\n' "$C_DIM" "$C_RESET"
 }
 
-render_account() {   # $1 = force, $2 = show labels (1/0)
-  local force=$1 labelled=$2 cs xs ls
-
-  if [ "$HAS_CLAUDE" = "1" ]; then
-    cs=$(ensure claude "$QUOTA_TTL" "$force")
-    quota_section "CLAUDE$([ "$labelled" = 1 ] && printf ' \302\267 %s' "$(claude_label)")" \
-      "$C_CYAN" "$cs" claude_rows claude_note "$(cache_file claude)" claude_hint
-    printf '\n'
-  fi
-
-  if [ "$HAS_CODEX" = "1" ]; then
-    xs=$(ensure codex "$QUOTA_TTL" "$force")
-    quota_section "CODEX$([ "$labelled" = 1 ] && printf ' \302\267 %s' "$(codex_label)")" \
-      "$C_MAGENTA" "$xs" codex_rows codex_note "$(cache_file codex)" codex_hint
-    printf '\n'
-  fi
-
-  [ "$HAS_CLAUDE" = "1" ] || return 0
-  ls=$(ensure local "$LOCAL_TTL" "$force")
-
-  local range tok cost msgs priced suffix=""
-  [ "$DAYS" = "1" ] && range="today" || range="${DAYS}d"
-  [ "$labelled" = 1 ] && suffix=" $(printf '\302\267') $(claude_label)"
-  if [ "$ls" = "missing" ]; then
-    printf ' %sBREAKDOWN%s %s(%s%s) scanning transcripts...%s\n\n' \
-      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$C_RESET"
-    return 0
-  fi
-
-  IFS=$'\t' read -r _ _ tok cost msgs _ priced < <(local_rows TOTAL)
-  tok=${tok:-0}; cost=${cost:-0}; msgs=${msgs:-0}
-  local costnote="\$ estimated"
-  if [ "${priced:-1}" != "1" ]; then
-    costnote="\$ is a floor - $(local_rows UNPRICED | wc -l | tr -d ' ') model(s) have no published rate"
-  fi
-  printf ' %sWHERE%s %s(%s%s - %s tok, ~$%.2f, %s msgs; %s)%s\n' \
-    "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$(human_tok "$tok")" "$cost" "$msgs" \
-    "$costnote" "$C_RESET"
-  breakdown_section "" PROJ "$tok" | tail -n +2
-  printf '\n'
-  printf ' %sWHAT%s %s(%s%s - by model)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$suffix" "$C_RESET"
-  breakdown_section "" MODEL "$tok" | tail -n +2
-
-  local cxtok cxmsgs
-  IFS=$'\t' read -r _ _ cxtok _ cxmsgs _ < <(local_rows CODEX_TOTAL)
-  if [ "${cxtok:-0}" -gt 0 ]; then
-    printf '\n'
-    printf ' %sCODEX%s %s(%s - %s tok, %s msgs; no public rate, tokens only)%s\n' \
-      "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$(human_tok "$cxtok")" "${cxmsgs:-0}" "$C_RESET"
-    breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2
-    breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2
-  fi
-  printf '\n'
-}
-
-render() {
-  local force=${1:-0} labelled=0 first=1
-  [ "$(account_count)" -gt 1 ] && labelled=1
-
-  printf '%s\342\224\214 AI Usage%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(date '+%H:%M:%S')" "$C_RESET"
-  while IFS=$'\t' read -r id label claude codex; do
-    [ -n "$id" ] || continue
-    [ "$first" = 1 ] || printf '%s%s%s\n\n' "$C_DIM" "  ────────────────────────────────────────" "$C_RESET"
-    first=0
-    with_account "$id" "$label" "$claude" "$codex"
-    render_account "$force" "$labelled"
-  done < <(load_accounts)
-
-  [ "$ONCE" = "0" ] && printf ' %s[q] quit  [r] refetch  [d] %s  -  api %ss, local %ss%s\n' \
-    "$C_DIM" "$([ "$DAYS" = "1" ] && echo "7 days" || echo "today")" "$QUOTA_TTL" "$LOCAL_TTL" "$C_RESET"
-  return 0
-}
-
+# The screen is two blocks: what is left of every limit, then where the tokens
+# went. Splitting it this way keeps one vendor from naming two different
+# sections, which is what made the old WHERE / WHAT / CODEX layout confusing.
 # A frame taller than the window scrolls, and what scrolls away is the top -
-# exactly the quota lines worth keeping. Clip from the bottom instead.
+# exactly the limits worth keeping. Clip from the bottom instead.
 #
 # The size has to come from /dev/tty: inside $(...) stdout is a pipe, so tput
 # cannot ioctl the terminal and quietly answers with terminfo's default 24 -
@@ -609,6 +543,111 @@ term_rows() {
 }
 
 clip_frame() { awk -v max="$1" 'NR <= max'; }
+
+limit_rows() {   # $1 = labelled (1/0) -> rows for the current account
+  local labelled=$1 now source status rowsfn hintfn notefn colour
+  now=$(date +%s)
+  for source in claude codex; do
+    if [ "$source" = claude ]; then
+      [ "$HAS_CLAUDE" = "1" ] || continue
+      rowsfn=claude_rows; hintfn=claude_hint; notefn=claude_note; colour=$C_CYAN
+    else
+      [ "$HAS_CODEX" = "1" ] || continue
+      rowsfn=codex_rows; hintfn=codex_hint; notefn=codex_note; colour=$C_MAGENTA
+    fi
+    status=$(ensure "$source" "$QUOTA_TTL" "$FORCE_FETCH")
+
+    local tag=""
+    [ "$labelled" = 1 ] && tag=$([ "$source" = claude ] && claude_label || codex_label)
+
+    if [ "$status" = "missing" ]; then
+      printf '   %s%-6s%s %s%s%s\n' "$colour" "$source" "$C_RESET" "$C_YELLOW" "$("$hintfn")" "$C_RESET"
+      continue
+    fi
+
+    local got=0 label pct reset trail
+    while IFS=$'\t' read -r label pct reset; do
+      [ -n "$label" ] || continue
+      got=1; trail=""
+      [ "${reset:-0}" -gt 0 ] && trail="${C_DIM}$(countdown $(( reset - now )))${C_RESET}"
+      printf '   %s%-6s%s %-8s %s %s%5.1f%%%s  %s\n' \
+        "$colour" "$source" "$C_RESET" "$label" "$(bar "$pct" 12)" \
+        "$(pct_color "$pct")" "$pct" "$C_RESET" "$trail"
+    done < <("$rowsfn")
+
+    if [ "$got" != 1 ]; then
+      printf '   %s%-6s%s %scould not read any limit - the API shape may have changed (--json)%s\n' \
+        "$colour" "$source" "$C_RESET" "$C_YELLOW" "$C_RESET"
+      continue
+    fi
+
+    local note; note=$("$notefn")
+    [ -n "$tag" ] && note="$tag${note:+  $note}"
+    printf '   %-6s %s%s%s%s\n' "" "$C_DIM" "$note" "${note:+  }" \
+      "$(human_age "$(file_age "$(cache_file "$source")")") ago$C_RESET"
+  done
+}
+
+usage_rows() {   # $1 = labelled (1/0) -> breakdown groups for the current account
+  local labelled=$1 tag="" tok cost msgs priced cxtok
+  [ "$HAS_CLAUDE" = "1" ] || return 0
+  [ "$(ensure local "$LOCAL_TTL" "$FORCE_FETCH")" = "missing" ] && {
+    printf '   %sscanning transcripts...%s\n' "$C_DIM" "$C_RESET"; return 0; }
+
+  [ "$labelled" = 1 ] && tag=" $(printf '\302\267') $(claude_label)"
+  IFS=$'\t' read -r _ _ tok cost msgs _ priced < <(local_rows TOTAL)
+  tok=${tok:-0}; cost=${cost:-0}; msgs=${msgs:-0}
+
+  local money
+  money=$(awk -v c="$cost" -v p="${priced:-1}" 'BEGIN { printf (p == 1 ? "~$%.2f" : ">$%.2f"), c }')
+  printf '   %sclaude%s%s %s(%s tok  %s  %s msgs)%s\n' \
+    "$C_CYAN" "$C_RESET" "$tag" "$C_DIM" "$(human_tok "$tok")" "$money" "$msgs" "$C_RESET"
+  printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
+  breakdown_section "" PROJ "$tok" | tail -n +2 | sed 's/^/     /'
+  printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
+  breakdown_section "" MODEL "$tok" | tail -n +2 | sed 's/^/     /'
+
+  IFS=$'\t' read -r _ _ cxtok _ msgs _ < <(local_rows CODEX_TOTAL)
+  [ "${cxtok:-0}" -gt 0 ] || return 0
+  printf '   %scodex%s %s(%s tok  %s msgs  no published rate)%s\n' \
+    "$C_MAGENTA" "$C_RESET" "$C_DIM" "$(human_tok "$cxtok")" "${msgs:-0}" "$C_RESET"
+  printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
+  breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2 | sed 's/^/     /'
+  printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
+  breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2 | sed 's/^/     /'
+}
+
+render() {
+  FORCE_FETCH=${1:-0}
+  local labelled=0 range multi
+  multi=$(account_count)
+  [ "$multi" -gt 1 ] && labelled=1
+  [ "$DAYS" = "1" ] && range="today" || range="${DAYS}d"
+
+  printf '%s\342\224\214 AI Usage%s  %s%s%s\n\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(date '+%H:%M:%S')" "$C_RESET"
+
+  printf ' %sLIMITS%s\n' "$C_BOLD" "$C_RESET"
+  while IFS=$'\t' read -r id label claude codex; do
+    [ -n "$id" ] || continue
+    with_account "$id" "$label" "$claude" "$codex"
+    limit_rows "$labelled"
+  done < <(load_accounts)
+  printf '\n'
+
+  if [ "$COMPACT" = "0" ]; then
+    printf ' %sUSAGE%s %s\302\267 %s%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$range" "$C_RESET"
+    while IFS=$'\t' read -r id label claude codex; do
+      [ -n "$id" ] || continue
+      with_account "$id" "$label" "$claude" "$codex"
+      usage_rows "$labelled"
+    done < <(load_accounts)
+  fi
+
+  [ "$ONCE" = "0" ] && printf '\n %s[q] quit  [r] refetch  [d] %s  [c] %s%s\n' \
+    "$C_DIM" "$([ "$DAYS" = "1" ] && echo "7 days" || echo "today")" \
+    "$([ "$COMPACT" = "1" ] && echo "show usage" || echo "limits only")" "$C_RESET"
+  return 0
+}
 
 # --------------------------------------------------------------- report ----
 # One machine-readable snapshot per account, so a GUI front end never has to
@@ -942,6 +981,17 @@ J
        | grep -c 'API shape may')" "1"
   ACCT_ID=a0
 
+  echo "self-test: nothing the script calls has gone missing"
+  local missing="" fn
+  for fn in load_accounts with_account account_count expand_home \
+            claude_rows codex_rows local_rows claude_hint codex_hint \
+            claude_label codex_label limit_rows usage_rows render \
+            breakdown_section term_rows clip_frame report menubar \
+            producer_claude producer_codex producer_local ensure fetch_sync; do
+    declare -F "$fn" >/dev/null 2>&1 || missing="$missing $fn"
+  done
+  check "every helper the script dispatches to is defined" "${missing:-none}" "none"
+
   echo "self-test: small windows"
   local long; long=$(printf 'l%s\n' 1 2 3 4 5 6 7 8 9 10)
   check "short frames pass through" \
@@ -1013,6 +1063,7 @@ while :; do
       q|Q) break ;;
       r|R) force=1 ;;
       d|D) [ "$DAYS" = "1" ] && DAYS=7 || DAYS=1 ;;
+      c|C) [ "$COMPACT" = "1" ] && COMPACT=0 || COMPACT=1 ;;
     esac
   fi
 done

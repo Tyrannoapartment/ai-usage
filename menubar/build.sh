@@ -24,8 +24,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>AIUsage</string>
   <key>CFBundleDisplayName</key><string>AI Usage</string>
   <key>CFBundleIdentifier</key><string>com.tyrannoapartment.aiusage</string>
-  <key>CFBundleVersion</key><string>${VERSION:-0.4.4}</string>
-  <key>CFBundleShortVersionString</key><string>${VERSION:-0.4.4}</string>
+  <key>CFBundleVersion</key><string>${VERSION:-0.5.0}</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION:-0.5.0}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>AIUsage</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
