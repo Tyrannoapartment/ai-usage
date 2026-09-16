@@ -220,6 +220,13 @@ at it.
 credential-source selection (Keychain vs. file, newest token wins), failure
 hints, token aggregation and de-duplication, pricing, and the display helpers.
 
+## Trademarks
+
+Not affiliated with, endorsed by, or sponsored by Anthropic or OpenAI. Their
+marks appear only to identify which service a reading belongs to, and are the
+property of their respective owners. `AI_USAGE_GLYPHS=0` drops the terminal
+marks; the menu bar app has a mark-free style built in.
+
 ## License
 
 MIT

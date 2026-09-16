@@ -17,6 +17,8 @@
 #   ai-usage              live view; clock and countdowns tick every second
 #   ai-usage --days 7     breakdown over 7 days instead of today
 #   ai-usage --compact    limits only, no breakdown
+#
+# AI_USAGE_GLYPHS=0 falls back to the vendor name where a font lacks the marks.
 #   ai-usage --once       print one frame and exit
 #   ai-usage --json       raw merged quota JSON
 #   ai-usage --menubar    one SwiftBar/xbar frame (see extras/)
@@ -172,75 +174,152 @@ fi
 
 # A seven-stop ramp: the further along a percentage sits, the hotter it reads.
 # Used both for the number and, position by position, for the bar itself.
-ramp() { awk -v p="$1" -v wide="$2" 'BEGIN {
-  if (wide) {
-    if (p < 20) c = 46; else if (p < 35) c = 82; else if (p < 50) c = 154
-    else if (p < 65) c = 226; else if (p < 78) c = 214
-    else if (p < 90) c = 208; else c = 196
-    printf "\033[38;5;%dm", c
-  } else {
-    if (p < 50) printf "\033[32m"; else if (p < 80) printf "\033[33m"
-    else printf "\033[31m"
-  } }'; }
+# These run once per row, every second, so they use shell arithmetic only:
+# forking awk 30 times a frame is what makes the terminal retitle itself over
+# and over. Percentages arrive as "81.0"; the integer part is enough to pick a
+# colour or a bar length.
+share_of() {   # tokens, total -> "12.3" (one decimal, no fork)
+  local t=$1 a=$2 x
+  case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  case "$a" in ''|*[!0-9]*) a=0 ;; esac
+  [ "$a" -gt 0 ] || { printf '0.0'; return; }
+  x=$(( (t * 1000 + a / 2) / a ))
+  printf '%d.%d' $(( x / 10 )) $(( x % 10 ))
+}
+
+int_of() { local v=${1%%.*}; case "$v" in ''|*[!0-9-]*) echo 0 ;; *) echo "$v" ;; esac; }
+
+ramp_code() {   # percent -> 256-colour index
+  local p; p=$(int_of "$1")
+  if   [ "$p" -lt 20 ]; then echo 46
+  elif [ "$p" -lt 35 ]; then echo 82
+  elif [ "$p" -lt 50 ]; then echo 154
+  elif [ "$p" -lt 65 ]; then echo 226
+  elif [ "$p" -lt 78 ]; then echo 214
+  elif [ "$p" -lt 90 ]; then echo 208
+  else echo 196; fi
+}
+
+ramp() {
+  local p; p=$(int_of "$1")
+  if [ "$2" = "1" ]; then
+    printf '\033[38;5;%sm' "$(ramp_code "$p")"
+  elif [ "$p" -lt 50 ]; then printf '\033[32m'
+  elif [ "$p" -lt 80 ]; then printf '\033[33m'
+  else printf '\033[31m'; fi
+}
 
 pct_color() { [ "$COLOR" = "1" ] && ramp "$1" "$WIDE" || true; }
 
-bar() {   # percent, width - filled cells are coloured by their own position
-  awk -v p="$1" -v w="$2" -v color="$COLOR" -v wide="$WIDE" 'BEGIN {
-    if (p < 0) p = 0; if (p > 100) p = 100
-    filled = int(p * w / 100 + 0.5)
-    for (i = 0; i < w; i++) {
-      if (i < filled) {
-        if (color) {
-          q = (i + 0.5) * 100 / w
-          if (wide) {
-            if (q < 20) c = 46; else if (q < 35) c = 82; else if (q < 50) c = 154
-            else if (q < 65) c = 226; else if (q < 78) c = 214
-            else if (q < 90) c = 208; else c = 196
-            printf "\033[38;5;%dm", c
-          } else {
-            if (q < 50) printf "\033[32m"; else if (q < 80) printf "\033[33m"
-            else printf "\033[31m"
-          }
-        }
-        printf "\342\226\210"
-      } else {
-        if (color) printf (wide ? "\033[38;5;236m" : "\033[2m")
-        printf "\342\226\221"
-      }
-    }
-    if (color) printf "\033[0m"
-  }'; }
+# Terminal.app tops out at 256 colours, so the brand hues are the nearest
+# entries rather than exact hex. A glyph stands in for each mark: the terminal
+# cannot draw vector art, but Claude's is a radiating asterisk anyway.
+brand_color() {
+  [ "$COLOR" = "1" ] || return 0
+  if [ "$WIDE" = "1" ]; then
+    case "$1" in
+      claude) printf '\033[38;5;173m' ;;   # nearest to #D97757
+      codex)  printf '\033[38;5;36m'  ;;   # nearest to #10A37F
+    esac
+  else
+    case "$1" in claude) printf '\033[33m' ;; codex) printf '\033[36m' ;; esac
+  fi
+}
 
-human_tok() { awk -v n="$1" 'BEGIN {
-  if (n >= 1000000000) printf "%.2fB", n/1000000000
-  else if (n >= 1000000) printf "%.1fM", n/1000000
-  else if (n >= 1000) printf "%.0fK", n/1000
-  else printf "%d", n }'; }
+# $(date) is a fork too, and the loop needs the time on every row.
+EPOCH_BASE=$(date +%s)
+SECONDS=0
+now_epoch() { echo $(( EPOCH_BASE + SECONDS )); }
+
+GLYPHS=${AI_USAGE_GLYPHS:-1}
+brand_mark() {
+  if [ "$GLYPHS" = "1" ]; then
+    case "$1" in
+      claude) printf '\342\234\263' ;;   # U+2733, closest to the Claude mark
+      codex)  printf '\342\235\213' ;;   # U+274B, reads like the OpenAI knot
+    esac
+  else
+    printf '%s' "$1"
+  fi
+}
+
+bar() {   # percent, width - filled cells are coloured by their own position
+  local p w filled i q out=""
+  p=$(int_of "$1"); w=$2
+  [ "$p" -lt 0 ] && p=0; [ "$p" -gt 100 ] && p=100
+  filled=$(( (p * w + 50) / 100 ))
+  for (( i = 0; i < w; i++ )); do
+    if [ "$i" -lt "$filled" ]; then
+      if [ "$COLOR" = "1" ]; then
+        q=$(( (i * 100 + 50) / w ))
+        if [ "$WIDE" = "1" ]; then
+          out="$out$(printf '\033[38;5;%sm' "$(ramp_code "$q")")"
+        elif [ "$q" -lt 50 ]; then out="$out$(printf '\033[32m')"
+        elif [ "$q" -lt 80 ]; then out="$out$(printf '\033[33m')"
+        else out="$out$(printf '\033[31m')"; fi
+      fi
+      out="$out\342\226\210"
+    else
+      if [ "$COLOR" = "1" ]; then
+        [ "$WIDE" = "1" ] && out="$out$(printf '\033[38;5;236m')" || out="$out$(printf '\033[2m')"
+      fi
+      out="$out\342\226\221"
+    fi
+  done
+  [ "$COLOR" = "1" ] && out="$out$(printf '\033[0m')"
+  printf '%b' "$out"
+}
+
+human_tok() {   # integer tokens -> 1.2M / 345K / 3.41B
+  local n=$1 whole tenths
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -ge 1000000000 ]; then
+    whole=$(( n / 1000000000 )); tenths=$(( (n % 1000000000) / 10000000 ))
+    printf '%d.%02dB' "$whole" "$tenths"
+  elif [ "$n" -ge 1000000 ]; then
+    whole=$(( n / 1000000 )); tenths=$(( (n % 1000000) / 100000 ))
+    printf '%d.%dM' "$whole" "$tenths"
+  elif [ "$n" -ge 1000 ]; then
+    printf '%dK' $(( (n + 500) / 1000 ))
+  else
+    printf '%d' "$n"
+  fi
+}
 
 # Ticks every second, so the countdown visibly moves between API refreshes.
-countdown() { awk -v s="$1" 'BEGIN {
-  if (s < 0) s = 0
-  d = int(s/86400); s -= d*86400
-  h = int(s/3600);  s -= h*3600
-  m = int(s/60);    s -= m*60
-  if (d > 0)      printf "%dd %02d:%02d:%02d", d, h, m, s
-  else if (h > 0) printf "%d:%02d:%02d", h, m, s
-  else            printf "%d:%02d", m, s }'; }
+countdown() {   # seconds -> 3d 00:52:31 / 4:08:12 / 1:31
+  local s=$1 d h m
+  case "$s" in ''|*[!0-9-]*) s=0 ;; esac
+  [ "$s" -lt 0 ] && s=0
+  d=$(( s / 86400 )); s=$(( s - d * 86400 ))
+  h=$(( s / 3600 ));  s=$(( s - h * 3600 ))
+  m=$(( s / 60 ));    s=$(( s - m * 60 ))
+  if   [ "$d" -gt 0 ]; then printf '%dd %02d:%02d:%02d' "$d" "$h" "$m" "$s"
+  elif [ "$h" -gt 0 ]; then printf '%d:%02d:%02d' "$h" "$m" "$s"
+  else printf '%d:%02d' "$m" "$s"; fi
+}
 
-human_age() { awk -v s="$1" 'BEGIN {
-  if (s < 60) printf "%ds", s
-  else if (s < 3600) printf "%dm", s/60
-  else printf "%.1fh", s/3600 }'; }
+human_age() {   # seconds -> 12s / 4m / 1.5h
+  local s=$1
+  case "$s" in ''|*[!0-9]*) s=0 ;; esac
+  if   [ "$s" -lt 60 ];   then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]; then printf '%dm' $(( s / 60 ))
+  else printf '%d.%dh' $(( s / 3600 )) $(( (s % 3600) / 360 )); fi
+}
 
-win_label() { awk -v s="$1" 'BEGIN {
-  if (s == 18000) print "5h"; else if (s == 86400) print "daily"
-  else if (s == 604800) print "weekly"
-  else if (s >= 86400) printf "%dd", s/86400; else printf "%dh", s/3600 }'; }
+win_label() {   # window length in seconds -> 5h / weekly / 12h
+  case "$1" in
+    18000) echo "5h" ;;
+    86400) echo "daily" ;;
+    604800) echo "weekly" ;;
+    *) if [ "${1:-0}" -ge 86400 ] 2>/dev/null; then printf '%dd' $(( $1 / 86400 ))
+       else printf '%dh' $(( ${1:-0} / 3600 )); fi ;;
+  esac
+}
 
 file_age() { local m
   m=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || { echo 999999999; return; }
-  echo $(( $(date +%s) - m )); }
+  echo $(( $(now_epoch) - m )); }
 
 # ------------------------------------------------------ data acquisition ----
 # Claude Code keeps its OAuth credentials in the macOS login Keychain and
@@ -278,7 +357,7 @@ claude_cred() {
 # tool can say so and stop hammering, instead of reporting a generic failure.
 note_status() {   # source, http status
   local f="$CACHE_DIR/$ACCT_ID-$1.status"
-  printf '%s %s\n' "$2" "$(date +%s)" > "$f"
+  printf '%s %s\n' "$2" "$(now_epoch)" > "$f"
 }
 
 # `cmd < missing 2>/dev/null` still prints: the shell reports the failed
@@ -412,7 +491,21 @@ codex_note() { jq -r '
     (if .spend_control.reached == true then "SPEND LIMIT REACHED" else empty end) ]
   | join("  ")' "$(cache_file codex)" 2>/dev/null; }
 
-local_rows() { grep "^$1"$'\t' "$(cache_file local)" 2>/dev/null; }
+# The aggregate is read into memory once a frame; grepping the same file five
+# times a second is another handful of processes the terminal reacts to.
+LOCAL_TSV=""
+load_local_tsv() {
+  local f; f=$(cache_file local)
+  if [ -r "$f" ]; then LOCAL_TSV=$(<"$f"); else LOCAL_TSV=""; fi
+}
+
+local_rows() {
+  [ -n "$LOCAL_TSV" ] || return 0
+  local kind=$1 line
+  while IFS= read -r line; do
+    case "$line" in "$kind"$'\t'*) printf '%s\n' "$line" ;; esac
+  done <<< "$LOCAL_TSV"
+}
 
 claude_hint() {
   local cred exp now
@@ -427,7 +520,7 @@ claude_hint() {
     429) echo "rate limited by the usage API - backing off for $(( (RATE_LIMIT_COOLDOWN - $(status_age claude)) / 60 + 1 ))m"; return ;;
     401|403) echo "the usage API rejected this token - run: claude"; return ;;
   esac
-  exp=$(cred_expiry "$cred"); now=$(date +%s)   # BSD awk has no systime()
+  exp=$(cred_expiry "$cred"); now=$(now_epoch)   # BSD awk has no systime()
   if [ "${exp:-0}" != "0" ] && awk -v e="$exp" -v n="$now" 'BEGIN { exit !(e/1000 < n) }'; then
     if keychain_item_present && [ -z "$(keychain_cred)" ]; then
       echo "Keychain is locked - run this on the Mac itself (ssh cannot read it)"
@@ -476,7 +569,7 @@ quota_row() {   # label, percent, reset_epoch, now
 
 quota_section() {   # title, color, status, rows-fn, note-fn, cache, hint-fn
   local title=$1 color=$2 status=$3 rowsfn=$4 notefn=$5 cache=$6 hintfn=$7 now tag="" got=0
-  now=$(date +%s)
+  now=$(now_epoch)
   case "$status" in
     stale)   tag="${C_YELLOW}stale${C_RESET}" ;;
     missing) tag="${C_DIM}loading...${C_RESET}" ;;
@@ -503,8 +596,8 @@ quota_section() {   # title, color, status, rows-fn, note-fn, cache, hint-fn
   printf '  %-*s %s%s ago%s\n' "$LBL" "" "$C_DIM" "$(human_age "$(file_age "$cache")")" "$C_RESET"
 }
 
-breakdown_section() {   # title, kind, total_tokens
-  local title=$1 kind=$2 total=$3 name tok cost msgs pad share
+breakdown_section() {   # title, kind, total_tokens, quiet-about-rates (1/0)
+  local title=$1 kind=$2 total=$3 quiet=${4:-0} name tok cost msgs pad priced share
   printf ' %s%s%s\n' "$C_BOLD" "$title" "$C_RESET"
   local got=0
   # No gauge and no heat colour here: a share of the window's tokens has no
@@ -512,12 +605,15 @@ breakdown_section() {   # title, kind, total_tokens
   while IFS=$'\t' read -r _ name tok cost msgs pad priced; do
     [ -n "$name" ] || continue
     got=1
-    share=$(awk -v t="$tok" -v a="$total" 'BEGIN { printf "%.1f", (a > 0 ? t*100/a : 0) }')
+    share=$(share_of "$tok" "$total")
     if [ "${priced:-1}" = "1" ]; then
       printf '  %s %5.1f%%  %7s  %s$%.2f%s\n' \
         "${pad:-$name}" "$share" "$(human_tok "$tok")" "$C_DIM" "$cost" "$C_RESET"
+    elif [ "$quiet" = "1" ]; then
+      # Every row in this section is unpriced; the heading already says so.
+      printf '  %s %5.1f%%  %7s\n' "${pad:-$name}" "$share" "$(human_tok "$tok")"
     else
-      printf '  %s %5.1f%%  %7s  %sno published rate%s\n' \
+      printf '  %s %5.1f%%  %7s  %sno rate%s\n' \
         "${pad:-$name}" "$share" "$(human_tok "$tok")" "$C_DIM" "$C_RESET"
     fi
   done < <(local_rows "$kind")
@@ -546,7 +642,7 @@ clip_frame() { awk -v max="$1" 'NR <= max'; }
 
 limit_rows() {   # $1 = labelled (1/0) -> rows for the current account
   local labelled=$1 now source status rowsfn hintfn notefn colour
-  now=$(date +%s)
+  now=$(now_epoch)
   for source in claude codex; do
     if [ "$source" = claude ]; then
       [ "$HAS_CLAUDE" = "1" ] || continue
@@ -560,8 +656,15 @@ limit_rows() {   # $1 = labelled (1/0) -> rows for the current account
     local tag=""
     [ "$labelled" = 1 ] && tag=$([ "$source" = claude ] && claude_label || codex_label)
 
+    local mark width
+    # printf pads by bytes, and the glyph is three of them, so the name is
+    # padded on its own and the mark prepended afterwards.
+    mark=$(printf '%s %-6s' "$(brand_mark "$source")" "$source")
+    width=0
+
     if [ "$status" = "missing" ]; then
-      printf '   %s%-6s%s %s%s%s\n' "$colour" "$source" "$C_RESET" "$C_YELLOW" "$("$hintfn")" "$C_RESET"
+      printf '   %s%s%s %s%s%s\n' "$(brand_color "$source")" "$mark" "$C_RESET" \
+        "$C_YELLOW" "$("$hintfn")" "$C_RESET"
       continue
     fi
 
@@ -570,20 +673,20 @@ limit_rows() {   # $1 = labelled (1/0) -> rows for the current account
       [ -n "$label" ] || continue
       got=1; trail=""
       [ "${reset:-0}" -gt 0 ] && trail="${C_DIM}$(countdown $(( reset - now )))${C_RESET}"
-      printf '   %s%-6s%s %-8s %s %s%5.1f%%%s  %s\n' \
-        "$colour" "$source" "$C_RESET" "$label" "$(bar "$pct" 12)" \
+      printf '   %s%s%s %-8s %s %s%5.1f%%%s  %s\n' \
+        "$(brand_color "$source")" "$mark" "$C_RESET" "$label" "$(bar "$pct" 12)" \
         "$(pct_color "$pct")" "$pct" "$C_RESET" "$trail"
     done < <("$rowsfn")
 
     if [ "$got" != 1 ]; then
-      printf '   %s%-6s%s %scould not read any limit - the API shape may have changed (--json)%s\n' \
-        "$colour" "$source" "$C_RESET" "$C_YELLOW" "$C_RESET"
+      printf '   %s%s%s %scould not read any limit - the API shape may have changed (--json)%s\n' \
+        "$(brand_color "$source")" "$mark" "$C_RESET" "$C_YELLOW" "$C_RESET"
       continue
     fi
 
     local note; note=$("$notefn")
     [ -n "$tag" ] && note="$tag${note:+  $note}"
-    printf '   %-6s %s%s%s%s\n' "" "$C_DIM" "$note" "${note:+  }" \
+    printf '   %-8s %s%s%s%s\n' "" "$C_DIM" "$note" "${note:+  }" \
       "$(human_age "$(file_age "$(cache_file "$source")")") ago$C_RESET"
   done
 }
@@ -593,6 +696,7 @@ usage_rows() {   # $1 = labelled (1/0) -> breakdown groups for the current accou
   [ "$HAS_CLAUDE" = "1" ] || return 0
   [ "$(ensure local "$LOCAL_TTL" "$FORCE_FETCH")" = "missing" ] && {
     printf '   %sscanning transcripts...%s\n' "$C_DIM" "$C_RESET"; return 0; }
+  load_local_tsv
 
   [ "$labelled" = 1 ] && tag=" $(printf '\302\267') $(claude_label)"
   IFS=$'\t' read -r _ _ tok cost msgs _ priced < <(local_rows TOTAL)
@@ -600,8 +704,9 @@ usage_rows() {   # $1 = labelled (1/0) -> breakdown groups for the current accou
 
   local money
   money=$(awk -v c="$cost" -v p="${priced:-1}" 'BEGIN { printf (p == 1 ? "~$%.2f" : ">$%.2f"), c }')
-  printf '   %sclaude%s%s %s(%s tok  %s  %s msgs)%s\n' \
-    "$C_CYAN" "$C_RESET" "$tag" "$C_DIM" "$(human_tok "$tok")" "$money" "$msgs" "$C_RESET"
+  printf '   %s%s claude%s%s %s(%s tok  %s  %s msgs)%s\n' \
+    "$(brand_color claude)" "$(brand_mark claude)" "$C_RESET" "$tag" "$C_DIM" \
+    "$(human_tok "$tok")" "$money" "$msgs" "$C_RESET"
   printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
   breakdown_section "" PROJ "$tok" | tail -n +2 | sed 's/^/     /'
   printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
@@ -609,12 +714,13 @@ usage_rows() {   # $1 = labelled (1/0) -> breakdown groups for the current accou
 
   IFS=$'\t' read -r _ _ cxtok _ msgs _ < <(local_rows CODEX_TOTAL)
   [ "${cxtok:-0}" -gt 0 ] || return 0
-  printf '   %scodex%s %s(%s tok  %s msgs  no published rate)%s\n' \
-    "$C_MAGENTA" "$C_RESET" "$C_DIM" "$(human_tok "$cxtok")" "${msgs:-0}" "$C_RESET"
+  printf '   %s%s codex%s %s(%s tok  %s msgs  tokens only - no public price)%s\n' \
+    "$(brand_color codex)" "$(brand_mark codex)" "$C_RESET" "$C_DIM" \
+    "$(human_tok "$cxtok")" "${msgs:-0}" "$C_RESET"
   printf '     %sby project%s\n' "$C_DIM" "$C_RESET"
-  breakdown_section "" CODEX_PROJ "$cxtok" | tail -n +2 | sed 's/^/     /'
+  breakdown_section "" CODEX_PROJ "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
   printf '     %sby model%s\n' "$C_DIM" "$C_RESET"
-  breakdown_section "" CODEX_MODEL "$cxtok" | tail -n +2 | sed 's/^/     /'
+  breakdown_section "" CODEX_MODEL "$cxtok" 1 | tail -n +2 | sed 's/^/     /'
 }
 
 render() {
@@ -655,6 +761,7 @@ render() {
 breakdown_for() {   # $1 = days
   DAYS=$1
   [ "$HAS_CLAUDE" = "1" ] && ensure local "$LOCAL_TTL" 0 >/dev/null
+  load_local_tsv
   rows_json() { jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
       | {name: .[1], tokens: (.[2] | tonumber), cost: (.[3] | tonumber),
          messages: (.[4] | tonumber), priced: ((.[6] // "1") == "1")})'; }
@@ -712,7 +819,7 @@ report() {
     with_account "$id" "$label" "$claude" "$codex"
     account_report >> "$tmp"
   done < <(load_accounts)
-  jq -n --argjson now "$(date +%s)" --argjson accounts "$(jq -s '.' "$tmp")" \
+  jq -n --argjson now "$(now_epoch)" --argjson accounts "$(jq -s '.' "$tmp")" \
     '{generated_at: $now, accounts: $accounts}'
   rm -f "$tmp"
 }
@@ -739,7 +846,7 @@ menubar() {
 
   local labelled=0 rows="" body="" now top pct
   [ "$(account_count)" -gt 1 ] && labelled=1
-  now=$(date +%s)
+  now=$(now_epoch)
 
   while IFS=$'\t' read -r id label claude codex; do
     [ -n "$id" ] || continue
@@ -949,7 +1056,7 @@ J
 
   echo "self-test: rate limiting"
   ACCT_ID=rl
-  printf '429 %s\n' "$(date +%s)" > "$tmp/rl-claude.status"
+  printf '429 %s\n' "$(now_epoch)" > "$tmp/rl-claude.status"
   check "a 429 is named, not hidden" \
     "$(CLAUDE_CREDS=$tmp/creds-ok.json claude_hint | cut -d- -f1)" "rate limited by the usage API "
   rm -f "$tmp/rl-claude.status"
