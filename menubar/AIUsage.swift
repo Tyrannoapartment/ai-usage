@@ -130,13 +130,16 @@ enum Palette {
     /// The same seven-stop ramp the terminal view uses.
     static func color(for percent: Double) -> NSColor {
         switch percent {
+        // Red arrives before the ceiling does: four fifths of a limit should
+        // already read as a warning rather than a comfortable orange.
         case ..<20:  return NSColor(srgbRed: 0.18, green: 0.63, blue: 0.26, alpha: 1)
-        case ..<35:  return NSColor(srgbRed: 0.25, green: 0.73, blue: 0.31, alpha: 1)
-        case ..<50:  return NSColor(srgbRed: 0.48, green: 0.79, blue: 0.44, alpha: 1)
-        case ..<65:  return NSColor(srgbRed: 0.83, green: 0.65, blue: 0.17, alpha: 1)
-        case ..<78:  return NSColor(srgbRed: 0.89, green: 0.53, blue: 0.17, alpha: 1)
-        case ..<90:  return NSColor(srgbRed: 0.94, green: 0.53, blue: 0.24, alpha: 1)
-        default:     return NSColor(srgbRed: 0.97, green: 0.32, blue: 0.29, alpha: 1)
+        case ..<40:  return NSColor(srgbRed: 0.25, green: 0.73, blue: 0.31, alpha: 1)
+        case ..<55:  return NSColor(srgbRed: 0.48, green: 0.79, blue: 0.44, alpha: 1)
+        case ..<68:  return NSColor(srgbRed: 0.85, green: 0.68, blue: 0.16, alpha: 1)
+        case ..<76:  return NSColor(srgbRed: 0.91, green: 0.53, blue: 0.15, alpha: 1)
+        case ..<82:  return NSColor(srgbRed: 0.95, green: 0.38, blue: 0.16, alpha: 1)
+        case ..<90:  return NSColor(srgbRed: 0.95, green: 0.24, blue: 0.20, alpha: 1)
+        default:     return NSColor(srgbRed: 0.85, green: 0.13, blue: 0.13, alpha: 1)
         }
     }
 }

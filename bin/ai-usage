@@ -190,14 +190,17 @@ share_of() {   # tokens, total -> "12.3" (one decimal, no fork)
 int_of() { local v=${1%%.*}; case "$v" in ''|*[!0-9-]*) echo 0 ;; *) echo "$v" ;; esac; }
 
 ramp_code() {   # percent -> 256-colour index
+  # Red has to arrive before the ceiling does: at four fifths of a limit the
+  # bar should already look like a warning, not a healthy orange.
   local p; p=$(int_of "$1")
   if   [ "$p" -lt 20 ]; then echo 46
-  elif [ "$p" -lt 35 ]; then echo 82
-  elif [ "$p" -lt 50 ]; then echo 154
-  elif [ "$p" -lt 65 ]; then echo 226
-  elif [ "$p" -lt 78 ]; then echo 214
-  elif [ "$p" -lt 90 ]; then echo 208
-  else echo 196; fi
+  elif [ "$p" -lt 40 ]; then echo 82
+  elif [ "$p" -lt 55 ]; then echo 154
+  elif [ "$p" -lt 68 ]; then echo 226
+  elif [ "$p" -lt 76 ]; then echo 214
+  elif [ "$p" -lt 82 ]; then echo 202
+  elif [ "$p" -lt 90 ]; then echo 196
+  else echo 160; fi
 }
 
 ramp() {
@@ -247,24 +250,20 @@ brand_mark() {
   fi
 }
 
-bar() {   # percent, width - filled cells are coloured by their own position
-  local p w filled i q out=""
+bar() {   # percent, width - filled in the colour its own value earns
+  # A gradient across the bar left a bar at 89% looking mostly green, which is
+  # the opposite of the point: the fill takes one colour, the value's.
+  local p w filled i out="" colour=""
   p=$(int_of "$1"); w=$2
   [ "$p" -lt 0 ] && p=0; [ "$p" -gt 100 ] && p=100
   filled=$(( (p * w + 50) / 100 ))
+  [ "$COLOR" = "1" ] && colour=$(ramp "$p" "$WIDE")
   for (( i = 0; i < w; i++ )); do
     if [ "$i" -lt "$filled" ]; then
-      if [ "$COLOR" = "1" ]; then
-        q=$(( (i * 100 + 50) / w ))
-        if [ "$WIDE" = "1" ]; then
-          out="$out$(printf '\033[38;5;%sm' "$(ramp_code "$q")")"
-        elif [ "$q" -lt 50 ]; then out="$out$(printf '\033[32m')"
-        elif [ "$q" -lt 80 ]; then out="$out$(printf '\033[33m')"
-        else out="$out$(printf '\033[31m')"; fi
-      fi
+      [ -n "$colour" ] && [ "$i" = 0 ] && out="$out$colour"
       out="$out\342\226\210"
     else
-      if [ "$COLOR" = "1" ]; then
+      if [ "$COLOR" = "1" ] && [ "$i" = "$filled" ]; then
         [ "$WIDE" = "1" ] && out="$out$(printf '\033[38;5;236m')" || out="$out$(printf '\033[2m')"
       fi
       out="$out\342\226\221"
